@@ -33,6 +33,7 @@ def clean_rib(val):
     return str(val).replace(" ", "").strip()
 
 def parse_money(val):
+    """Convertit '1 234,56' ou '1234.56' en float."""
     if pd.isna(val) or val == "": return 0.0
     s = str(val).replace(" ", "").replace(",", ".")
     try: return float(s)
@@ -65,15 +66,22 @@ def generate_report(df_data, df_avance, df_credit, df_ribs_supp, df_restos_diff)
     df_data['phone_clean'] = df_data['driver Phone'].apply(clean_phone)
     df_data['resto_clean'] = df_data['restaurant name'].apply(clean_name)
     
+    # Nettoyage des colonnes monétaires (virgules, espaces...)
+    cols_to_clean = ['driver payout', 'amount to restaurant', 'coupon discount', 
+                     'delivery amount', 'service charge', 'restaurant commission',
+                     'Driver Cash Co', 'Bonus Amount']
+    for c in cols_to_clean:
+        if c in df_data.columns:
+            df_data[c] = df_data[c].apply(parse_money)
+        else:
+            df_data[c] = 0.0
+
     # 2. Préparation Liste Restos Différés
     deferred_restos_set = set()
     if not df_restos_diff.empty:
-        # On cherche la colonne qui contient les noms
-        # On suppose que c'est la première ou celle qui contient "name"/"nom"
         cols = [str(c).lower() for c in df_restos_diff.columns]
+        # Recherche intelligente de la colonne "nom"
         idx_name = next((i for i, c in enumerate(cols) if 'name' in c or 'nom' in c or 'restaurant' in c), 0)
-        
-        # On charge tous les noms normalisés dans un SET pour recherche rapide
         col_name = df_restos_diff.columns[idx_name]
         deferred_restos_set = set(df_restos_diff[col_name].apply(clean_name).dropna().unique())
 
@@ -110,26 +118,23 @@ def generate_report(df_data, df_avance, df_credit, df_ribs_supp, df_restos_diff)
         
         # --- LOGIQUE PAIEMENT & DIFFÉRÉ ---
         
-        # 1. Différé via Méthode de Paiement (Corporate/Deferred)
+        # 1. Différé via Méthode de Paiement (Corporate/Deferred/Payzone)
         payment_methods = group['Payment Method'].astype(str)
-        is_method_deferred = payment_methods.str.contains('Deferred|Corporate|Différé', case=False, na=False)
+        is_payzone = payment_methods.str.contains('PAYZONE', case=False, na=False)
+        is_deferred_method = payment_methods.str.contains('Deferred|Corporate|Différé', case=False, na=False)
         
         # 2. Différé via Fichier Resto
-        # On vérifie si le nom du resto est dans notre liste
         is_resto_deferred = group['resto_clean'].isin(deferred_restos_set)
         
-        # Une commande est différée si l'un OU l'autre est vrai
-        is_globally_deferred = is_method_deferred | is_resto_deferred
+        # "NO-PAY-RESTO" : Le livreur ne paie pas le restaurant (Yassir s'en charge)
+        # C'est vrai si Payzone, Différé, ou si le Restaurant est dans la liste différée
+        is_no_pay_resto = is_payzone | is_deferred_method | is_resto_deferred
         
-        # Payzone
-        is_payzone = payment_methods.str.contains('PAYZONE', case=False, na=False)
-        
-        # Cash = Ce qui n'est ni Payzone ni Différé
-        # (Si un resto est différé, le livreur ne paie pas, donc ce n'est pas un flux Cash sortant pour lui)
-        is_cash = (~is_payzone) & (~is_globally_deferred) & (payment_methods.str.upper().str.strip() == 'CASH')
+        # Cash = Ce qui n'est PAS "No-Pay-Resto" et qui est marqué CASH
+        is_payment_cash = payment_methods.str.upper().str.strip() == 'CASH'
         
         # Comptes
-        deferred_orders = is_globally_deferred.sum()
+        deferred_orders = (is_deferred_method | is_resto_deferred).sum()
         payzone_orders = is_payzone.sum()
         returned_orders = group['status'].str.contains('Returned', case=False).sum()
         
@@ -138,25 +143,32 @@ def generate_report(df_data, df_avance, df_credit, df_ribs_supp, df_restos_diff)
         payout = group['driver payout'].sum()
         
         # Yassir amount to restaurant :
-        # On inclut Payzone + TOUS les Différés (Corporate ou via Fichier Resto)
-        # Car dans ces cas, le livreur ne paie pas le resto, c'est Yassir qui paie.
-        amt_rest_yassir = group.loc[is_payzone | is_globally_deferred, 'amount to restaurant'].sum()
+        # Tout ce que le livreur ne paie pas, Yassir le paie.
+        amt_rest_yassir = group.loc[is_no_pay_resto, 'amount to restaurant'].sum()
         
-        # Coupon Discount : Uniquement pertinent en CASH
-        coupon_cash = group.loc[is_cash, 'coupon discount'].sum()
+        # Coupon Discount : Pertinent seulement si Cash (remboursement au livreur)
+        coupon_cash = group.loc[is_payment_cash, 'coupon discount'].sum()
         
         bonus = group['Bonus Amount'].sum()
         
         # Delivery Amount & Service Charge (Flux Cash uniquement)
-        delivery_amt = group.loc[is_cash, 'delivery amount'].sum()
-        service_charge_cash = group.loc[is_cash, 'service charge'].sum()
+        delivery_amt = group.loc[is_payment_cash, 'delivery amount'].sum()
+        service_charge_cash = group.loc[is_payment_cash, 'service charge'].sum()
         rest_comm = group['restaurant commission'].sum()
         
-        # Cash Collecté (Valeur absolue)
-        # Note: Le 'Driver Cash Co' du fichier Data intègre déjà normalement la logique du système.
-        # Si le système est bien paramétré, il sait que tel resto est différé.
-        # On garde la valeur du fichier.
-        cash_co_sum = abs(group['Driver Cash Co'].sum())
+        # --- CORRECTION DU SOLDE (CASH CO) ---
+        # Si le fichier Data a déjà déduit le prix du repas du Cash Co (ex: -136 pour Payzone),
+        # alors que le livreur n'a pas payé ce repas, il faut lui rendre cet argent virtuellement.
+        # Sinon on lui retirerait de sa paie le prix d'un repas qu'il n'a pas acheté.
+        
+        original_cash_co = group['Driver Cash Co'].sum()
+        correction_resto = group.loc[is_no_pay_resto, 'amount to restaurant'].sum()
+        
+        corrected_cash_co_sum = original_cash_co + correction_resto
+        
+        # Calcul de la part Cash du Solde
+        # (On inverse le signe car Cash Co négatif = Yassir doit au livreur)
+        solde_cash_part = -1 * corrected_cash_co_sum
         
         # Récupération RIB
         final_rib = rib_mapping.get(phone, "")
@@ -172,7 +184,7 @@ def generate_report(df_data, df_avance, df_credit, df_ribs_supp, df_restos_diff)
             'Total Orders': total_orders,
             'Yassir Market Orders': market_orders,
             'Food Orders': food_orders,
-            'Deferred Orders': deferred_orders, # Inclut mtn les restos du fichier
+            'Deferred Orders': deferred_orders,
             'Payzone Orders': payzone_orders,
             'Returned Orders': returned_orders,
             'Yassir driver payout': payout,
@@ -185,7 +197,7 @@ def generate_report(df_data, df_avance, df_credit, df_ribs_supp, df_restos_diff)
             'driver amount to restaurant': 0,
             'driver restaurant commission': rest_comm,
             'driver service Charge': service_charge_cash,
-            '_abs_cash_co': cash_co_sum
+            'Solde_Partiel': solde_cash_part
         }
         report_rows.append(row)
         
@@ -203,10 +215,16 @@ def generate_report(df_data, df_avance, df_credit, df_ribs_supp, df_restos_diff)
         else:
             df_avance['phone_clean'] = df_avance.iloc[:, -1].apply(clean_phone)
             
-        av_grp = df_avance.groupby('phone_clean')['Avance'].sum()
-        df_rep = df_rep.merge(av_grp, left_on='driver Phone', right_index=True, how='left').fillna({'Avance': 0})
+        # Nettoyage montant
+        col_av_val = next((c for c in df_avance.columns if 'avance' in str(c).lower()), None)
+        if col_av_val:
+             df_avance['Avance_Clean'] = df_avance[col_av_val].apply(parse_money)
+             av_grp = df_avance.groupby('phone_clean')['Avance_Clean'].sum()
+             df_rep = df_rep.merge(av_grp, left_on='driver Phone', right_index=True, how='left').fillna({'Avance_Clean': 0})
+        else:
+             df_rep['Avance_Clean'] = 0
     else:
-        df_rep['Avance'] = 0
+        df_rep['Avance_Clean'] = 0
         
     if not df_credit.empty:
         cols_cr = [str(c).lower() for c in df_credit.columns]
@@ -227,14 +245,14 @@ def generate_report(df_data, df_avance, df_credit, df_ribs_supp, df_restos_diff)
 
     # --- D. Calcul Solde Final ---
     df_rep['Total Amount (Driver Solde)'] = (
-        df_rep['_abs_cash_co'] + 
-        df_rep['Bonus Value'] + 
+        df_rep['Solde_Partiel'] + 
         df_rep['Credit Balance'] - 
-        df_rep['Avance']
+        df_rep['Avance_Clean']
     )
     
-    df_rep = df_rep.rename(columns={'Avance': 'Avance payé'})
+    df_rep = df_rep.rename(columns={'Avance_Clean': 'Avance payé'})
     
+    # Colonnes finales ordonnées
     target_cols = [
         'driver Phone', 'driver name', 'RIB', '3pl driver name', 'Total Orders', 
         'Yassir Market Orders', 'Food Orders', 'Deferred Orders', 'Payzone Orders', 
@@ -255,8 +273,7 @@ def generate_report(df_data, df_avance, df_credit, df_ribs_supp, df_restos_diff)
 # ==========================================
 
 st.title("📊 Générateur de Rapport Yassir (Expert)")
-
-st.info("Ce module gère : Data, Avances, Crédits, RIBs manquants et Restaurants Différés.")
+st.caption("Module complet : Data, Finances, RIBs et Gestion avancée des Restos Différés.")
 
 col1, col2 = st.columns(2)
 
@@ -275,7 +292,7 @@ with col2:
 
 if st.button("🚀 Lancer le Calcul", type="primary"):
     if f_data:
-        with st.spinner("Analyse croisée des 5 fichiers..."):
+        with st.spinner("Analyse croisée des fichiers..."):
             # Chargement
             df_d = load_data(f_data)
             df_a = load_data(f_avance)
@@ -291,7 +308,7 @@ if st.button("🚀 Lancer le Calcul", type="primary"):
                 
                 # KPIs
                 c1, c2, c3 = st.columns(3)
-                c1.metric("Commandes Différées", int(df_res['Deferred Orders'].sum()))
+                c1.metric("Payzone + Différés", int(df_res['Deferred Orders'].sum() + df_res['Payzone Orders'].sum()))
                 c2.metric("Montant Resto (Yassir)", f"{df_res['Yassir amount to restaurant'].sum():,.2f}")
                 c3.metric("Solde à Payer", f"{df_res['Total Amount (Driver Solde)'].sum():,.2f}")
 

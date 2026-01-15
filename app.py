@@ -5,207 +5,230 @@ import re
 import io
 from datetime import datetime
 
-st.set_page_config(page_title="Générateur de Paie Yassir", layout="wide")
+st.set_page_config(page_title="Générateur Paie Yassir (Complet)", layout="wide")
 
 # ==========================================
-# 1. FONCTIONS UTILITAIRES
+# 1. FONCTIONS DE NETTOYAGE
 # ==========================================
 
 def clean_phone(val):
-    """Normalise le numéro de téléphone (+212...)."""
-    if pd.isna(val) or val == "":
-        return ""
-    s = str(val).replace(" ", "").replace(".", "").strip()
-    # Garder chiffres et +
+    """Normalise le téléphone (+212...)."""
+    if pd.isna(val) or val == "": return ""
+    s = str(val).replace(" ", "").replace(".", "").replace("-", "").strip()
     s = re.sub(r'[^0-9\+]', '', s)
     
-    if s.startswith("00"):
-        s = "+" + s[2:]
-    elif s.startswith("212"):
-        s = "+" + s
-    elif s.startswith("0") and len(s) == 10:
-        s = "+212" + s[1:]
+    if s.startswith("00"): s = "+" + s[2:]
+    elif s.startswith("212"): s = "+" + s
+    elif s.startswith("0") and len(s) == 10: s = "+212" + s[1:]
     
-    # S'assurer qu'il commence par +212 si ce n'est pas le cas
-    if not s.startswith("+"):
-        s = "+212" + s
-        
+    if not s.startswith("+"): s = "+212" + s
     return s
 
 def clean_name(val):
-    """Nettoie le nom du chauffeur."""
     if pd.isna(val): return ""
     return str(val).lower().strip()
 
+def clean_rib(val):
+    """Nettoie le RIB pour l'affichage."""
+    if pd.isna(val): return ""
+    return str(val).replace(" ", "").strip()
+
 def parse_money(val):
-    """Convertit '1 234,56' ou '1234.56' en float."""
+    """Convertit '1 234,56' en float."""
     if pd.isna(val) or val == "": return 0.0
     s = str(val).replace(" ", "").replace(",", ".")
-    try:
-        return float(s)
-    except:
-        return 0.0
+    try: return float(s)
+    except: return 0.0
 
 def load_data(file):
-    """Charge un fichier CSV/Excel avec détection automatique."""
-    if file.name.endswith('.xlsx'):
-        return pd.read_excel(file)
+    """Charge CSV ou Excel intelligemment."""
+    if not file: return pd.DataFrame()
     try:
-        # Essai virgule
+        if file.name.endswith('.xlsx'):
+            return pd.read_excel(file)
+        # Test CSV virgule puis point-virgule
+        file.seek(0)
         df = pd.read_csv(file)
         if len(df.columns) < 2:
             file.seek(0)
             df = pd.read_csv(file, sep=';')
         return df
-    except:
+    except Exception as e:
+        st.error(f"Erreur lecture {file.name}: {e}")
         return pd.DataFrame()
 
 # ==========================================
-# 2. LOGIQUE DE CALCUL
+# 2. MOTEUR DE CALCUL
 # ==========================================
 
-def generate_report(df_data, df_avance, df_credit):
+def generate_report(df_data, df_avance, df_credit, df_ribs_supp):
     
-    # --- 1. Préparation Data ---
-    # Normalisation des clés pour jointure
+    # --- A. Préparation des Données ---
+    
+    # 1. Nettoyage Data
     df_data['phone_clean'] = df_data['driver Phone'].apply(clean_phone)
-    df_data['name_clean'] = df_data['driver name'].apply(clean_name)
     
-    # Filtrer les commandes annulées (On garde Delivered et Returned pour le compte, à ajuster si besoin)
-    # Selon l'analyse, il faut exclure "Cancelled" pour que les totaux matchent
+    # 2. Nettoyage RIBs Supplémentaires
+    rib_mapping = {}
+    if not df_ribs_supp.empty:
+        # Trouver les colonnes automatiquement
+        cols = [str(c).lower() for c in df_ribs_supp.columns]
+        idx_phone = next((i for i, c in enumerate(cols) if 'phone' in c or 'téléphone' in c), -1)
+        idx_rib = next((i for i, c in enumerate(cols) if 'rib' in c), -1)
+        
+        if idx_phone != -1 and idx_rib != -1:
+            col_phone = df_ribs_supp.columns[idx_phone]
+            col_rib = df_ribs_supp.columns[idx_rib]
+            
+            # Créer un dictionnaire {Telephone: RIB}
+            df_ribs_supp['temp_phone'] = df_ribs_supp[col_phone].apply(clean_phone)
+            rib_mapping = df_ribs_supp.set_index('temp_phone')[col_rib].to_dict()
+
+    # 3. Filtrage (Exclure les Annulées)
+    # On garde Delivered et Returned. On exclut 'Cancelled'.
     df_valid = df_data[~df_data['status'].str.contains("Cancelled", case=False, na=False)].copy()
     
-    # --- 2. Agrégation par Chauffeur ---
+    # --- B. Agrégation par Livreur ---
     
-    # On groupe par téléphone (clé unique)
     groups = df_valid.groupby('phone_clean')
-    
     report_rows = []
     
     for phone, group in groups:
-        # Infos de base
         driver_name = group['driver name'].iloc[0]
         
-        # --- Calculs des Colonnes ---
-        
-        # Total Orders
+        # --- 1. Logique Commandes & Types ---
         total_orders = len(group)
         
-        # Market vs Food (Logique : si restaurant name contient "market" ou services adapté)
-        # Note: dans l'exemple Younes, tout était Food. On suppose Market si mot clé trouvé.
-        is_market = group['restaurant name'].str.contains('market|shop', case=False, na=False)
+        # Détection Market vs Food
+        is_market = group['restaurant name'].str.contains('market|shop|carrefour|bim', case=False, na=False)
         market_orders = is_market.sum()
         food_orders = total_orders - market_orders
         
-        # Payment Methods
-        is_deferred = group['Payment Method'].astype(str).str.contains('Deferred', case=False, na=False)
-        is_payzone = group['Payment Method'].astype(str).str.contains('PAYZONE', case=False, na=False)
-        is_cash = group['Payment Method'].astype(str).str.upper() == 'CASH'
+        # Détection Paiements
+        payment_methods = group['Payment Method'].astype(str)
+        
+        # Différé = 'Deferred', 'Corporate', ou parfois vide si spécifié
+        is_deferred = payment_methods.str.contains('Deferred|Corporate|Différé', case=False, na=False)
+        is_payzone = payment_methods.str.contains('PAYZONE', case=False, na=False)
+        # Cash est tout ce qui n'est ni Payzone, ni Différé (simplification, ou check explicite 'CASH')
+        is_cash = payment_methods.str.upper().str.strip() == 'CASH'
         
         deferred_orders = is_deferred.sum()
         payzone_orders = is_payzone.sum()
+        returned_orders = group['status'].str.contains('Returned', case=False).sum()
         
-        # Returned
-        returned_orders = group['status'].astype(str).str.contains('Returned', case=False).sum()
+        # --- 2. Logique Financière ---
         
-        # Financier
-        # Yassir driver payout : Somme totale
         payout = group['driver payout'].sum()
         
-        # Yassir amount to restaurant : Somme pour NON-CASH (Payzone/Card)
-        # (D'après l'analyse : 121 pour Younes correspondait uniquement à la commande Payzone)
+        # Yassir amount to restaurant : Uniquement pour les commandes NON Cash (Payzone/Deferred)
+        # Car en Cash, le livreur paie le resto avec le cash client.
+        # En Payzone/Différé, Yassir doit payer le resto, donc c'est comptabilisé ici.
         amt_rest_yassir = group.loc[~is_cash, 'amount to restaurant'].sum()
         
-        # Yassir coupon discount : Somme pour CASH
-        # (D'après l'analyse : 1553 vs 1613 total, la diff était le Payzone)
+        # Coupon Discount : Uniquement pertinent en CASH (remboursement au livreur)
         coupon_cash = group.loc[is_cash, 'coupon discount'].sum()
         
-        # Bonus
         bonus = group['Bonus Amount'].sum()
         
-        # Driver delivery amount (Cash only?)
-        # Younes avait 36.686. Payzone était 0. Donc somme totale = somme cash.
+        # Delivery Amount & Service Charge (Flux Cash uniquement)
         delivery_amt = group.loc[is_cash, 'delivery amount'].sum()
-        
-        # Driver restaurant commission
+        service_charge_cash = group.loc[is_cash, 'service charge'].sum()
         rest_comm = group['restaurant commission'].sum()
         
-        # Driver service charge (Cash only)
-        # Younes 145 (Cash) vs 150 (Total). Target 145.
-        service_charge_cash = group.loc[is_cash, 'service charge'].sum()
+        # Cash Collecté (Valeur absolue pour le calcul)
+        cash_co_sum = abs(group['Driver Cash Co'].sum())
         
-        # Cash Collected (pour le calcul du solde)
-        # On utilise la colonne 'Driver Cash Co'. 
-        # Formule déduite : Solde = abs(Sum Cash Co) + Bonus - Avance + Credit
-        cash_co_sum = group['Driver Cash Co'].sum()
+        # --- 3. Récupération du RIB ---
+        # Priorité : Fichier RIB supplémentaire > Fichier Data > Vide
+        final_rib = rib_mapping.get(phone, "")
+        if not final_rib and 'RIB' in group.columns:
+            # Essayer de trouver un RIB non nul dans le groupe
+            potential_ribs = group['RIB'].dropna().unique()
+            if len(potential_ribs) > 0:
+                final_rib = potential_ribs[0]
         
+        # Construction de la ligne
         row = {
             'driver Phone': phone,
             'driver name': driver_name,
-            'RIB': '', # À remplir manuellement ou via un fichier tiers
-            '3pl driver name': 0, # Par défaut 0
+            'RIB': clean_rib(final_rib),
+            '3pl driver name': 0,
             'Total Orders': total_orders,
             'Yassir Market Orders': market_orders,
             'Food Orders': food_orders,
-            'Deferred Orders': deferred_orders,
+            'Deferred Orders': deferred_orders, # Colonne Paiement Différé
             'Payzone Orders': payzone_orders,
             'Returned Orders': returned_orders,
             'Yassir driver payout': payout,
             'Yassir amount to restaurant': amt_rest_yassir,
             'Yassir coupon discount': coupon_cash,
-            'Payment Guarantee': 0, # Pas de colonne trouvée, 0 par défaut
+            'Payment Guarantee': 0,
             'Bonus Value': bonus,
-            'Recovered Amount': 0, # Par défaut
+            'Recovered Amount': 0,
             'driver delivery amount': delivery_amt,
-            'driver amount to restaurant': 0, # 0 dans l'exemple
+            'driver amount to restaurant': 0,
             'driver restaurant commission': rest_comm,
             'driver service Charge': service_charge_cash,
-            '_abs_cash_co': abs(cash_co_sum) # Intermédiaire pour calcul
+            '_abs_cash_co': cash_co_sum # Intermédiaire
         }
         report_rows.append(row)
         
     df_rep = pd.DataFrame(report_rows)
+    if df_rep.empty: return pd.DataFrame()
+
+    # --- C. Fusion Avance & Crédit ---
     
-    # --- 3. Intégration Avance & Crédit ---
-    
+    # Fusion Avance
     if not df_avance.empty:
-        df_avance['phone_clean'] = df_avance[' driver Phone '].apply(clean_phone) # Notez les espaces dans le nom de colonne CSV original
+        df_avance['phone_clean'] = df_avance.iloc[:, -1].apply(clean_phone) # Souvent dernière colonne
+        # Sécurité : chercher colonne phone par nom si possible
+        cols_av = [str(c).lower() for c in df_avance.columns]
+        idx_ph = next((i for i,c in enumerate(cols_av) if 'phone' in c), -1)
+        if idx_ph != -1:
+            df_avance['phone_clean'] = df_avance.iloc[:, idx_ph].apply(clean_phone)
+            
         av_grp = df_avance.groupby('phone_clean')['Avance'].sum()
-        df_rep = df_rep.merge(av_grp, left_on='driver Phone', right_index=True, how='left')
-        df_rep['Avance'] = df_rep['Avance'].fillna(0)
+        df_rep = df_rep.merge(av_grp, left_on='driver Phone', right_index=True, how='left').fillna({'Avance': 0})
     else:
         df_rep['Avance'] = 0
         
+    # Fusion Crédit
     if not df_credit.empty:
-        df_credit['phone_clean'] = df_credit[' driver Phone '].apply(clean_phone)
-        # Nettoyage montant crédit (virgule)
-        df_credit['amount_clean'] = df_credit['amount'].astype(str).apply(parse_money)
-        cr_grp = df_credit.groupby('phone_clean')['amount_clean'].sum()
-        df_rep = df_rep.merge(cr_grp, left_on='driver Phone', right_index=True, how='left')
-        df_rep['amount_clean'] = df_rep['amount_clean'].fillna(0)
-    else:
-        df_rep['amount_clean'] = 0
+        # Chercher colonne phone
+        cols_cr = [str(c).lower() for c in df_credit.columns]
+        idx_ph = next((i for i,c in enumerate(cols_cr) if 'phone' in c), -1)
+        col_amt = next((c for c in df_credit.columns if 'amount' in str(c).lower()), None)
         
-    # --- 4. Calcul Final (Solde) ---
-    # Formule : abs(CashCo) + Bonus + Credit - Avance
-    # (Note: abs(CashCo) car CashCo est négatif dans Data pour l'argent collecté)
+        if idx_ph != -1 and col_amt:
+            df_credit['phone_clean'] = df_credit.iloc[:, idx_ph].apply(clean_phone)
+            df_credit['amt_clean'] = df_credit[col_amt].apply(parse_money)
+            cr_grp = df_credit.groupby('phone_clean')['amt_clean'].sum()
+            df_rep = df_rep.merge(cr_grp, left_on='driver Phone', right_index=True, how='left')
+            df_rep = df_rep.rename(columns={'amt_clean': 'Credit Balance'})
+            df_rep['Credit Balance'] = df_rep['Credit Balance'].fillna(0)
+    else:
+         df_rep['Credit Balance'] = 0
+    
+    if 'Credit Balance' not in df_rep.columns: df_rep['Credit Balance'] = 0
+
+    # --- D. Calcul Solde Final ---
+    # Solde = CashCollecté (dû par livreur) + Credit - Avance + Bonus - (Gains Payout + Remboursements) ??
+    # NON, formule validée précédemment : Solde (ce que Yassir doit au livreur ou inverse)
+    # Basé sur ton fichier cible : Solde = |CashCo| + Bonus + Credit - Avance
+    
     df_rep['Total Amount (Driver Solde)'] = (
         df_rep['_abs_cash_co'] + 
         df_rep['Bonus Value'] + 
-        df_rep['amount_clean'] - 
+        df_rep['Credit Balance'] - 
         df_rep['Avance']
     )
     
-    # --- 5. Mise en forme finale ---
-    # Renommer pour correspondre EXACTEMENT au fichier cible
-    final_cols = {
-        'Avance': 'Avance payé',
-        'amount_clean': 'Credit Balance'
-    }
-    df_rep = df_rep.rename(columns=final_cols)
+    # Renommage final
+    df_rep = df_rep.rename(columns={'Avance': 'Avance payé'})
     
-    # Ordre des colonnes cible
-    target_columns = [
+    # Colonnes finales ordonnées
+    target_cols = [
         'driver Phone', 'driver name', 'RIB', '3pl driver name', 'Total Orders', 
         'Yassir Market Orders', 'Food Orders', 'Deferred Orders', 'Payzone Orders', 
         'Returned Orders', 'Yassir driver payout', 'Yassir amount to restaurant', 
@@ -215,58 +238,81 @@ def generate_report(df_data, df_avance, df_credit):
         'driver service Charge', 'Total Amount (Driver Solde)'
     ]
     
-    # Ajouter les colonnes manquantes (ex: RIB) si absentes
-    for c in target_columns:
-        if c not in df_rep.columns:
-            df_rep[c] = 0 if c != 'RIB' else ''
-            
-    return df_rep[target_columns]
+    # Compléter colonnes manquantes
+    for c in target_cols:
+        if c not in df_rep.columns: df_rep[c] = 0
+        
+    return df_rep[target_cols]
 
 # ==========================================
-# 3. INTERFACE STREAMLIT
+# 3. INTERFACE
 # ==========================================
 
-st.title("📊 Générateur de Rapport Livreur (Yassir)")
+st.title("📊 Générateur de Rapport Yassir (Avancé)")
+
+with st.expander("ℹ️ Guide d'utilisation", expanded=True):
+    st.write("""
+    1. Chargez le fichier **Data** (obligatoire).
+    2. Chargez les fichiers **Avance** et **Crédit** si disponibles.
+    3. Chargez le fichier **RIBs Livreur** pour compléter les RIBs manquants.
+    4. Le système détecte automatiquement les commandes **Différées/Corporate** via la colonne 'Payment Method'.
+    """)
 
 col1, col2 = st.columns(2)
 
 with col1:
-    st.subheader("1. Fichiers Données")
-    f_data = st.file_uploader("Fichier Data (Data 1314...)", type=['csv', 'xlsx'])
+    st.subheader("📁 Fichier Principal")
+    f_data = st.file_uploader("Importer Data (CSV/Excel)", type=['csv', 'xlsx'], key="data")
     
-with col2:
-    st.subheader("2. Fichiers Financiers")
-    f_avance = st.file_uploader("Fichier Avance", type=['csv', 'xlsx'])
-    f_credit = st.file_uploader("Fichier Crédit", type=['csv', 'xlsx'])
+    st.subheader("💳 Fichiers Financiers")
+    f_avance = st.file_uploader("Importer Avances", type=['csv', 'xlsx'], key="av")
+    f_credit = st.file_uploader("Importer Crédits", type=['csv', 'xlsx'], key="cr")
 
-if st.button("🚀 Générer le Rapport Calcul", type="primary"):
+with col2:
+    st.subheader("🏦 Données Supplémentaires")
+    f_ribs = st.file_uploader("Importer RIBs manquants (Optionnel)", type=['csv', 'xlsx'], key="rib")
+    st.caption("Ce fichier doit contenir une colonne Téléphone et une colonne RIB.")
+
+if st.button("🚀 Lancer le Calcul", type="primary"):
     if f_data:
-        with st.spinner("Calcul en cours..."):
+        with st.spinner("Traitement des fichiers en cours..."):
             # Chargement
             df_d = load_data(f_data)
-            df_a = load_data(f_avance) if f_avance else pd.DataFrame()
-            df_c = load_data(f_credit) if f_credit else pd.DataFrame()
+            df_a = load_data(f_avance)
+            df_c = load_data(f_credit)
+            df_r = load_data(f_ribs)
             
             if not df_d.empty:
                 # Génération
-                df_result = generate_report(df_d, df_a, df_c)
+                df_res = generate_report(df_d, df_a, df_c, df_r)
                 
-                # Aperçu
-                st.success(f"Rapport généré pour {len(df_result)} livreurs !")
-                st.dataframe(df_result.head())
+                st.success(f"Calcul terminé ! {len(df_res)} livreurs traités.")
                 
-                # Export Excel (meilleur pour les formats chiffres)
+                # Stats rapides
+                col_a, col_b, col_c = st.columns(3)
+                col_a.metric("Total Payout", f"{df_res['Yassir driver payout'].sum():,.2f}")
+                col_b.metric("Commandes Différées", int(df_res['Deferred Orders'].sum()))
+                col_c.metric("Solde Total", f"{df_res['Total Amount (Driver Solde)'].sum():,.2f}")
+
+                st.dataframe(df_res.head(10))
+                
+                # Export
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                    df_result.to_excel(writer, index=False, sheet_name='Feuille1')
+                    df_res.to_excel(writer, index=False, sheet_name='Calcul')
+                    # Ajustement largeur colonnes
+                    worksheet = writer.sheets['Calcul']
+                    worksheet.set_column('A:A', 15) # Tel
+                    worksheet.set_column('B:B', 25) # Nom
+                    worksheet.set_column('C:C', 30) # RIB
                     
                 st.download_button(
-                    label="💾 Télécharger le fichier Calcul (Excel)",
+                    "💾 Télécharger le rapport Excel",
                     data=buffer.getvalue(),
-                    file_name=f"Calcul_Genere_{datetime.now().strftime('%d_%m_%Y')}.xlsx",
+                    file_name=f"Calcul_Paie_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                     mime="application/vnd.ms-excel"
                 )
             else:
-                st.error("Erreur : Le fichier Data est vide ou illisible.")
+                st.error("Le fichier Data semble vide.")
     else:
-        st.warning("Veuillez charger au moins le fichier Data.")
+        st.warning("Merci de charger le fichier Data.")

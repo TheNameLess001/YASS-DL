@@ -5,13 +5,15 @@ import re
 import io
 from datetime import datetime
 
-st.set_page_config(page_title="Générateur Paie Yassir", layout="wide")
+# Configuration de la page (DOIT être la première commande Streamlit)
+st.set_page_config(page_title="Calcul Paie Livreur Yassir", layout="wide")
 
 # ==========================================
 # 1. OUTILS DE NETTOYAGE
 # ==========================================
 
 def clean_phone(val):
+    """Normalise le téléphone en format +212... pour servir de clé unique."""
     if pd.isna(val) or val == "": return ""
     s = str(val).replace(" ", "").replace(".", "").replace("-", "").strip()
     s = re.sub(r'[^0-9\+]', '', s)
@@ -22,27 +24,36 @@ def clean_phone(val):
     return s
 
 def clean_name(val):
+    """Nettoie les noms (minuscule, sans espaces inutiles)."""
     if pd.isna(val): return ""
     return str(val).lower().strip()
 
 def clean_rib(val):
+    """Formate le RIB proprement."""
     if pd.isna(val): return ""
     return str(val).replace(" ", "").strip()
 
 def parse_money(val):
+    """Convertit les montants (ex: '1 200,50' -> 1200.50)."""
     if pd.isna(val) or val == "": return 0.0
+    # On enlève les espaces milliers et on remplace virgule par point
     s = str(val).replace(" ", "").replace(",", ".")
+    # On garde uniquement chiffres, point et signe moins
     s = re.sub(r'[^0-9\.\-]', '', s)
     try: return float(s)
     except: return 0.0
 
 def load_data(file):
+    """Charge le fichier selon son format (Excel, CSV virgule ou point-virgule)."""
     if not file: return pd.DataFrame()
     try:
         if file.name.endswith('.xlsx'):
             return pd.read_excel(file)
+        
         file.seek(0)
+        # Test CSV standard
         df = pd.read_csv(file)
+        # Si tout est dans une colonne, on tente le point-virgule
         if len(df.columns) < 2:
             file.seek(0)
             df = pd.read_csv(file, sep=';')
@@ -100,7 +111,6 @@ def generate_report(df_data, df_avance, df_credit, df_ribs_supp, df_restos_diff)
         driver_name = group['driver name'].iloc[0]
         
         # --- TYPOLOGIE ---
-        # 1. Non-Cash (Le livreur n'a pas l'argent)
         # Payzone
         is_payzone = group['Payment Method'].astype(str).str.contains('PAYZONE', case=False, na=False)
         # Différé Méthode
@@ -109,12 +119,10 @@ def generate_report(df_data, df_avance, df_credit, df_ribs_supp, df_restos_diff)
         is_resto_def = group['resto_clean'].isin(deferred_restos_set)
         
         # Global Non-Cash (Pour le calcul Commission à verser)
-        # Attention: Si Resto Différé mais Client Cash -> Livreur a le cash. 
-        # Mais le livreur n'a pas payé le resto.
-        # Logique demandée : "Paiement différé = le livreur ne paie pas la commande mais doit avoir sa commission".
-        # Si le client paie Cash, le livreur a le Cash. Il se paie dessus.
-        # Donc "Non-Cash" strict pour le versement = Payzone OU Corporate.
         is_strict_non_cash = is_payzone | is_meth_def
+        
+        # Global No-Pay-Resto (Le livreur ne paie pas le resto)
+        is_yassir_pay_resto = is_payzone | is_meth_def | is_resto_def
         
         # Commandes Cash (Le livreur a le cash)
         is_cash = (~is_strict_non_cash) & (group['Payment Method'].astype(str).str.upper().str.strip() == 'CASH')
@@ -122,19 +130,13 @@ def generate_report(df_data, df_avance, df_credit, df_ribs_supp, df_restos_diff)
         # --- CALCULS ---
         
         # Payout (Commission)
-        # A verser uniquement pour les commandes où il n'a pas de cash (Payzone/Corporate)
-        # Pour le Cash, il l'a déjà pris à la source.
-        # Note : Le fichier final demande "Yassir driver payout" (Total).
         total_payout = group['driver payout'].sum()
         payout_to_pay = group.loc[is_strict_non_cash, 'driver payout'].sum()
         
         # Resto Amount
-        # A verser aux restos par Yassir (Payzone + Corporate + Resto Différé)
-        is_yassir_pay_resto = is_payzone | is_meth_def | is_resto_def
         amt_rest_yassir = group.loc[is_yassir_pay_resto, 'amount to restaurant'].sum()
         
         # Coupon
-        # A rembourser au livreur uniquement si Cash (car il a encaissé moins)
         coupon_reimb = group.loc[is_cash, 'coupon discount'].sum()
         
         # Bonus
@@ -218,7 +220,6 @@ def generate_report(df_data, df_avance, df_credit, df_ribs_supp, df_restos_diff)
     df_rep['Credit Balance'] = df_rep['Credit Balance'].fillna(0)
     
     # --- SOLDE FINAL ---
-    # Solde = (Commissions Non-Cash) + (Coupon Cash) + Bonus + Credit + Garantie - Avance
     df_rep['Total Amount (Driver Solde)'] = (
         df_rep['_payout_to_pay'] + 
         df_rep['Yassir coupon discount'] + 
@@ -237,7 +238,6 @@ def generate_report(df_data, df_avance, df_credit, df_ribs_supp, df_restos_diff)
         'driver delivery amount', 'driver service Charge', 'Total Amount (Driver Solde)'
     ]
     
-    # Compléter colonnes manquantes
     for c in cols_order:
         if c not in df_rep.columns: df_rep[c] = 0
         
@@ -248,6 +248,15 @@ def generate_report(df_data, df_avance, df_credit, df_ribs_supp, df_restos_diff)
 # ==========================================
 
 st.title("Calcul Paie Livreur (Logique Validée)")
+
+with st.expander("📖 Lire la logique de calcul appliquée", expanded=False):
+    st.markdown("""
+    **Formule du Solde Final :**
+    $$Solde = (Commissions_{Différé/Payzone}) + (Remboursement Coupon_{Cash}) + Bonus + Crédit + Garantie - Avance$$
+    """)
+
+# CRÉATION DES COLONNES (L'erreur était ici si cette ligne manquait)
+col1, col2 = st.columns(2)
 
 with col1:
     f_data = st.file_uploader("1. DATA", type=['csv', 'xlsx'])
@@ -260,18 +269,33 @@ with col2:
 
 if st.button("Lancer", type="primary"):
     if f_data:
-        df_d = load_data(f_data)
-        df_a = load_data(f_av)
-        df_c = load_data(f_cr)
-        df_r = load_data(f_rib)
-        df_re = load_data(f_rest)
-        
-        if not df_d.empty:
-            res = generate_report(df_d, df_a, df_c, df_r, df_re)
-            st.metric("Total à Verser", f"{res['Total Amount (Driver Solde)'].sum():,.2f}")
-            st.dataframe(res)
+        with st.spinner("Calcul en cours..."):
+            df_d = load_data(f_data)
+            df_a = load_data(f_av)
+            df_c = load_data(f_cr)
+            df_r = load_data(f_rib)
+            df_re = load_data(f_rest)
             
-            b = io.BytesIO()
-            with pd.ExcelWriter(b, engine='xlsxwriter') as w:
-                res.to_excel(w, index=False)
-            st.download_button("Télécharger Excel", b.getvalue(), "Paie_Finale.xlsx")
+            if not df_d.empty:
+                res = generate_report(df_d, df_a, df_c, df_r, df_re)
+                
+                # KPIs
+                tot_payout = res['Total Amount (Driver Solde)'].sum()
+                st.metric("Total à Verser (Net)", f"{tot_payout:,.2f} MAD")
+                
+                st.dataframe(res)
+                
+                b = io.BytesIO()
+                with pd.ExcelWriter(b, engine='xlsxwriter') as w:
+                    res.to_excel(w, index=False, sheet_name='Paie')
+                
+                st.download_button(
+                    "💾 Télécharger le Fichier Final",
+                    data=b.getvalue(),
+                    file_name=f"Paie_Finale_{datetime.now().strftime('%d%m%Y')}.xlsx",
+                    mime="application/vnd.ms-excel"
+                )
+            else:
+                st.error("Le fichier Data est vide.")
+    else:
+        st.warning("Veuillez charger le fichier Data.")

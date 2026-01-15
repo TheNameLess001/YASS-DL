@@ -18,6 +18,7 @@ def normalize_label(s):
     if pd.isna(s) or s == "":
         return ""
     s = str(s).lower().strip()
+    # Gestion des espaces multiples et caractères invisibles
     s = unicodedata.normalize('NFD', s).encode('ascii', 'ignore').decode("utf-8")
     s = re.sub(r'[^a-z0-9]+', ' ', s).strip()
     return s
@@ -46,7 +47,8 @@ def normalize_driver_phone(val, default_indicatif="+212"):
         num = "+" + num[2:]
     
     if num.startswith("212"):
-        num = "+" + num
+        if not num.startswith("+"): num = "+" + num
+        return num
         
     if not num.startswith("+"):
         # Enlève le premier 0
@@ -61,54 +63,78 @@ def normalize_driver_name(name):
     return str(name).lower().strip()
 
 def parse_date_custom(val, is_transaction=False):
-    """
-    Tente de parser la date.
-    Logique GAS repliquée : si heure < 3h du matin pour une commande, on recule d'un jour.
-    """
+    """Tente de parser la date."""
     if pd.isna(val) or val == "":
         return pd.NaT
     
-    # Si c'est déjà un objet datetime pandas/python
     if isinstance(val, (pd.Timestamp, datetime)):
         dt = val
     else:
-        # Essai de conversion générique
         try:
-            dt = pd.to_datetime(val, dayfirst=True) # dayfirst pour gérer le format FR courant
+            # Essaie format jour/mois/année (courant dans vos fichiers)
+            dt = pd.to_datetime(val, dayfirst=True, errors='coerce')
         except:
             return pd.NaT
 
     if pd.isna(dt): return pd.NaT
 
-    # Logique métier spécifique au script original pour les commandes
+    # Logique métier : si commande < 3h du matin, recule d'un jour
     if not is_transaction:
-        if dt.hour < 3:
+        if dt.hour < 3 and dt.hour >= 0:
             dt = dt - timedelta(days=1)
             
     return dt
 
+def clean_money_value(val):
+    """Convertit '27,558' ou '100' en float."""
+    if pd.isna(val) or val == "":
+        return 0.0
+    s = str(val).replace(',', '.').strip()
+    s = re.sub(r'[^0-9\.\-]', '', s) # Garde chiffres, point et signe moins
+    try:
+        return float(s)
+    except:
+        return 0.0
+
+def load_file_auto_separator(uploaded_file):
+    """Charge un CSV en détectant le séparateur (; ou ,)."""
+    try:
+        # Si c'est un Excel
+        if uploaded_file.name.endswith('.xlsx') or uploaded_file.name.endswith('.xls'):
+            return pd.read_excel(uploaded_file)
+        
+        # Si c'est un CSV, on lit les premières lignes pour deviner
+        content = uploaded_file.getvalue().decode('utf-8', errors='ignore')
+        first_line = content.split('\n')[0]
+        
+        sep = ','
+        if first_line.count(';') > first_line.count(','):
+            sep = ';'
+            
+        uploaded_file.seek(0)
+        return pd.read_csv(uploaded_file, sep=sep)
+    except Exception as e:
+        st.error(f"Erreur lecture {uploaded_file.name}: {e}")
+        return pd.DataFrame()
+
 # ==========================================
-# 2. LOGIQUE MÉTIER (COMMISSION & HEADERS)
+# 2. LOGIQUE MÉTIER
 # ==========================================
 
 def get_commission_map(df_commission):
-    """Crée un dictionnaire {nom_restaurant: {variable, fixe, location}}."""
     if df_commission is None or df_commission.empty:
         return {}
-    
     cols = [normalize_label(c) for c in df_commission.columns]
-    
-    # Identification des colonnes
     idx_restau = next((i for i, c in enumerate(cols) if any(x in c for x in ['restaurant', 'restau'])), -1)
+    
+    if idx_restau == -1: return {}
+    
+    # Mapping colonnes optionnelles
     idx_var = next((i for i, c in enumerate(cols) if any(x in c for x in ['variable', 'commission'])), -1)
     idx_fixe = next((i for i, c in enumerate(cols) if any(x in c for x in ['fixe'])), -1)
-    idx_loc = next((i for i, c in enumerate(cols) if any(x in c for x in ['location', 'adresse', 'zone', 'ville'])), -1)
+    idx_loc = next((i for i, c in enumerate(cols) if any(x in c for x in ['location', 'adresse', 'zone'])), -1)
 
     mapping = {}
-    if idx_restau == -1:
-        st.error("Colonne 'Restaurant' introuvable dans le fichier Commission.")
-        return {}
-
     for row in df_commission.itertuples(index=False):
         raw_name = str(row[idx_restau]) if pd.notna(row[idx_restau]) else ""
         clean_name = raw_name.lower().strip()
@@ -125,17 +151,13 @@ def get_commission_map(df_commission):
         fixe_val = 0.0
         if idx_fixe != -1 and pd.notna(row[idx_fixe]):
             try:
-                f = str(row[idx_fixe]).replace(',', '.') # nettoyage basique
+                f = str(row[idx_fixe]).replace(',', '.')
                 f = re.sub(r'[^0-9\.-]', '', f)
                 fixe_val = float(f)
             except: pass
             
-        loc_val = ""
-        if idx_loc != -1 and pd.notna(row[idx_loc]):
-            loc_val = str(row[idx_loc]).strip()
-
+        loc_val = str(row[idx_loc]).strip() if idx_loc != -1 and pd.notna(row[idx_loc]) else ""
         mapping[clean_name] = {'variable': var_val, 'fixe': fixe_val, 'location': loc_val}
-    
     return mapping
 
 def identify_header_type(columns):
@@ -144,52 +166,48 @@ def identify_header_type(columns):
     compact_cols = [normalize_compact(c) for c in columns]
     
     for i, c in enumerate(norm_cols):
-        # Commande check
+        # Commande
         if re.search(r'^n(o|um(ero)?)?\s*commande(\s*yassir)?$', c) or \
            c == "order id" or compact_cols[i] == "orderid":
             return "commande", columns[i]
             
-        # Transaction check
-        if c == "id transaction" or compact_cols[i] == "idtransaction":
+        # Transaction (id_transaction, transaction id, etc)
+        if "id transaction" in c or compact_cols[i] in ["idtransaction", "transactionid"]:
             return "transaction", columns[i]
             
     return None, None
 
 # ==========================================
-# 3. FONCTIONS PRINCIPALES (IMPORT & UPDATE)
+# 3. IMPORTATION
 # ==========================================
 
-def process_import(df_main, files_to_import, commission_map, df_livreur=None):
-    """Traite l'importation des fichiers."""
-    
+def process_import(df_main, files_to_import, commission_map):
     log_report = []
     new_rows = []
     
-    # 1. Création des sets de clés existantes pour dédoublonnage
+    # 1. Repérage des colonnes clés dans Data
+    main_cols_norm = [normalize_label(c) for c in df_main.columns]
+    
     existing_commands = set()
     existing_transactions = set()
     
-    # Repérage des colonnes clés dans le fichier maitre
-    main_cols_norm = [normalize_label(c) for c in df_main.columns]
-    
-    # Recherche ID Commande dans Main
-    idx_cmd = next((i for i, c in enumerate(main_cols_norm) if identify_header_type([df_main.columns[i]])[0] == "commande"), -1)
+    # Chercher la colonne Order ID
+    idx_cmd = next((i for i, c in enumerate(main_cols_norm) if c in ["order id", "n commande"]), -1)
     if idx_cmd != -1:
-        existing_commands = set(df_main.iloc[:, idx_cmd].dropna().apply(normalize_key))
+        existing_commands = set(df_main.iloc[:, idx_cmd].dropna().astype(str).apply(normalize_key))
 
-    # Recherche ID Transaction dans Main
-    idx_trans = next((i for i, c in enumerate(main_cols_norm) if identify_header_type([df_main.columns[i]])[0] == "transaction"), -1)
+    # Chercher la colonne Transaction ID
+    idx_trans = next((i for i, c in enumerate(main_cols_norm) if c in ["transaction id", "id transaction"]), -1)
     if idx_trans != -1:
-        existing_transactions = set(df_main.iloc[:, idx_trans].dropna().apply(normalize_key))
+        existing_transactions = set(df_main.iloc[:, idx_trans].dropna().astype(str).apply(normalize_key))
 
-    total_imported = 0
-    
-    # Colonnes Fixes requises
-    REQUIRED_COLS = ["Commission", "Variable %", "Fixe (DT)", "Location", "amount", 
-                     "id_transaction", "Monnaie", "Avance", "Nom du fichier", 
-                     "Date d'import", "Statut", "Utilisateur", "driver Phone", "Annulée?", "Status", "driver name", "RIB"]
-
-    # S'assurer que df_main a toutes les colonnes requises
+    # 2. Colonnes requises (ajout si manquantes)
+    REQUIRED_COLS = [
+        "Commission", "Variable %", "Fixe (DT)", "Location", "amount", 
+        "Transaction ID", "Monnaie", "Avance", "Nom du fichier", 
+        "Date d'import", "Statut", "Utilisateur", "driver Phone", 
+        "Annulée?", "Status", "driver name", "RIB", "Date"
+    ]
     for col in REQUIRED_COLS:
         if col not in df_main.columns:
             df_main[col] = pd.NA
@@ -198,46 +216,41 @@ def process_import(df_main, files_to_import, commission_map, df_livreur=None):
     
     for idx_file, uploaded_file in enumerate(files_to_import):
         filename = uploaded_file.name
-        
-        # Lecture fichier
-        try:
-            if filename.endswith('.csv'):
-                # Détection séparateur simple
-                try:
-                    temp_df = pd.read_csv(uploaded_file, sep=None, engine='python')
-                except:
-                    uploaded_file.seek(0)
-                    temp_df = pd.read_csv(uploaded_file, sep=',')
-            else:
-                temp_df = pd.read_excel(uploaded_file)
-        except Exception as e:
-            log_report.append(f"❌ {filename} : Erreur lecture ({str(e)})")
-            continue
+        temp_df = load_file_auto_separator(uploaded_file)
             
         if temp_df.empty or len(temp_df) < 1:
-            log_report.append(f"⚠️ {filename} : Vide")
+            log_report.append(f"⚠️ {filename} : Vide ou illisible")
             continue
 
-        # Identification Type
         type_file, key_col_name = identify_header_type(temp_df.columns)
         
         if not type_file:
-            log_report.append(f"⚠️ {filename} : Ignoré (Pas de colonne ID Commande ou Transaction)")
+            log_report.append(f"⚠️ {filename} : Ignoré (Pas de colonne ID trouvée)")
             continue
             
-        # Normalisation headers fichier source pour mapping
-        src_map = {normalize_label(c): c for c in temp_df.columns}
-        
         imported_count = 0
         skipped_count = 0
         
-        # Préparation mapping colonnes (Source -> Colonnes Standards)
-        col_montant = next((c for c in temp_df.columns if normalize_label(c) in ["montant total","montant","total","total ttc"]), None)
-        col_remise = next((c for c in temp_df.columns if normalize_label(c) in ["remise", "discount"]), None)
-        col_restau = next((c for c in temp_df.columns if normalize_label(c) in ['restaurant','restau','restaur','nom du restaurant','restaurant name']), None)
+        # Mapping des colonnes sources
+        # On pré-calcule les index des colonnes utiles dans le fichier source
+        cols_src_norm = [normalize_label(c) for c in temp_df.columns]
+        
+        # Helper pour trouver le nom exact de la colonne source
+        def find_src_col(patterns):
+            for i, c_norm in enumerate(cols_src_norm):
+                if c_norm in patterns: return temp_df.columns[i]
+                for p in patterns:
+                    if p in c_norm: return temp_df.columns[i]
+            return None
+
+        col_montant = find_src_col(["montant", "amount", "total"])
+        col_remise = find_src_col(["remise", "discount"])
+        col_restau = find_src_col(["restaurant name", "restau"])
+        col_avance = find_src_col(["avance"]) # Spécifique fichier Avance
+        col_phone_src = find_src_col(["driver phone", "cin"])
+        col_date_src = find_src_col(["issue date", "issue_date", "date"])
         
         for _, row in temp_df.iterrows():
-            # Check ID
             raw_id = row[key_col_name]
             norm_id = normalize_key(raw_id)
             
@@ -245,6 +258,7 @@ def process_import(df_main, files_to_import, commission_map, df_livreur=None):
                 skipped_count += 1
                 continue
                 
+            # Dédoublonnage
             if type_file == "commande" and norm_id in existing_commands:
                 skipped_count += 1
                 continue
@@ -252,264 +266,141 @@ def process_import(df_main, files_to_import, commission_map, df_livreur=None):
                 skipped_count += 1
                 continue
                 
-            # Création de la nouvelle ligne (dictionnaire)
+            # --- Construction de la nouvelle ligne ---
             new_row = {col: pd.NA for col in df_main.columns}
             
-            # 1. Remplissage basique (mapping par nom)
+            # 1. Copie générique des données (mapping par nom approximatif)
             for src_col in temp_df.columns:
                 norm_src = normalize_label(src_col)
-                
-                # Mapping spécial Date
-                if norm_src in ["issue date", "issue_date", "date"]:
-                    target_col = "Date" # Standardiser vers "Date"
-                    val = parse_date_custom(row[src_col], is_transaction=(type_file=="transaction"))
-                    if val is not pd.NaT:
-                         new_row[target_col] = val
-                    
-                    # Cas spécial Transaction: issue date -> order day si existe
-                    if type_file == "transaction" and norm_src in ["issue date", "issue_date"]:
-                        if "order day" in df_main.columns:
-                            new_row["order day"] = val
-                
-                # Mapping spécial Phone
-                elif norm_src in ["cin", "driver phone"]:
-                    new_row["driver Phone"] = normalize_driver_phone(row[src_col])
-                    
-                # Mapping spécial Nom driver
-                elif norm_src in ["driver name", "nom livreur"]:
-                    new_row["driver name"] = normalize_driver_name(row[src_col])
-                
-                # Mapping direct si colonne existe dans Main (par nom approximatif)
-                else:
-                    # Chercher correspondance dans main
-                    found = False
-                    for main_c in df_main.columns:
-                        if normalize_label(main_c) == norm_src:
-                            new_row[main_c] = row[src_col]
-                            found = True
-                            break
-                    # Si colonne inconnue dans Main mais présente dans Source, on pourrait l'ajouter
-                    # Pour simplifier ici, on ne garde que ce qui matche df_main ou les colonnes fixes
+                # On cherche si ce nom existe dans df_main
+                for main_col in df_main.columns:
+                    if normalize_label(main_col) == norm_src:
+                        new_row[main_col] = row[src_col]
+
+            # 2. Mappings spécifiques forcés
+            # ID
+            if type_file == "commande":
+                new_row["order id"] = raw_id # Supposant que "order id" existe
+            else:
+                new_row["Transaction ID"] = raw_id
             
-            # 2. Colonnes Méta
+            # Date
+            if col_date_src:
+                val_date = parse_date_custom(row[col_date_src], is_transaction=(type_file=="transaction"))
+                if pd.notna(val_date):
+                    new_row["Date"] = val_date
+                    if "order day" in df_main.columns and type_file == "transaction":
+                        new_row["order day"] = val_date
+
+            # Driver Phone
+            if col_phone_src:
+                new_row["driver Phone"] = normalize_driver_phone(row[col_phone_src])
+                
+            # Avance (Spécifique fichier Avance)
+            if col_avance:
+                new_row["Avance"] = clean_money_value(row[col_avance])
+                
+            # Amount / Montant (Spécifique fichier Credit)
+            if col_montant:
+                new_row["amount"] = clean_money_value(row[col_montant])
+
+            # Meta-données
             new_row["Nom du fichier"] = filename
             new_row["Date d'import"] = datetime.now()
             new_row["Statut"] = "Importé"
-            new_row["Utilisateur"] = "Streamlit User"
+            
             if type_file == "transaction":
-                new_row["Annulée?"] = "Delivered" # Logique du script original pour transaction
+                new_row["Annulée?"] = "Delivered"
                 new_row["Status"] = "Delivered"
 
-            # 3. Calcul Commission
-            montant = float(row[col_montant]) if col_montant and pd.notna(row[col_montant]) else 0.0
-            remise = float(row[col_remise]) if col_remise and pd.notna(row[col_remise]) else 0.0
-            # Nettoyage NaN venant de float conversion
-            if np.isnan(montant): montant = 0.0
-            if np.isnan(remise): remise = 0.0
-            
-            net = montant - remise
-            
-            restau_name = str(row[col_restau]).lower().strip() if col_restau and pd.notna(row[col_restau]) else ""
-            com_info = commission_map.get(restau_name, {'variable': 0, 'fixe': 0, 'location': ""})
-            
-            new_row["Commission"] = net * com_info['variable']
-            new_row["Variable %"] = com_info['variable'] * 100
-            new_row["Fixe (DT)"] = com_info['fixe']
-            new_row["Location"] = com_info['location']
-            
-            # Ajout aux listes de contrôle pour le fichier courant (auto-dédoublonnage)
+            # 3. Calculs Commission (seulement si Resto présent)
+            if col_restau and pd.notna(row[col_restau]):
+                restau_name = str(row[col_restau]).lower().strip()
+                com_info = commission_map.get(restau_name, {'variable': 0, 'fixe': 0, 'location': ""})
+                
+                # Montant pour commission
+                m = clean_money_value(row[col_montant]) if col_montant else 0.0
+                r = clean_money_value(row[col_remise]) if col_remise else 0.0
+                net = m - r
+                
+                new_row["Commission"] = net * com_info['variable']
+                new_row["Variable %"] = com_info['variable'] * 100
+                new_row["Fixe (DT)"] = com_info['fixe']
+                new_row["Location"] = com_info['location']
+
+            # Mise à jour des sets de contrôle
             if type_file == "commande": existing_commands.add(norm_id)
             if type_file == "transaction": existing_transactions.add(norm_id)
             
             new_rows.append(new_row)
             imported_count += 1
-            total_imported += 1
 
         log_report.append(f"✅ {filename} : +{imported_count} lignes / ⛔ {skipped_count} doublons")
-        
-        # Mise à jour barre progression
         progress_bar.progress((idx_file + 1) / len(files_to_import))
 
-    # Concaténation finale
     if new_rows:
         df_new = pd.DataFrame(new_rows)
-        # Alignement des colonnes
         df_concat = pd.concat([df_main, df_new], ignore_index=True)
     else:
         df_concat = df_main
 
-    # 4. Post-traitement : Mapping RIB Livreur
-    if df_livreur is not None and not df_livreur.empty:
-        # Création map Nom -> RIB
-        liv_cols = [normalize_label(c) for c in df_livreur.columns]
-        idx_liv_nom = next((i for i, c in enumerate(liv_cols) if c in ["driver name", "nom livreur"]), -1)
-        idx_liv_rib = next((i for i, c in enumerate(liv_cols) if c == "rib"), -1)
-        
-        if idx_liv_nom != -1 and idx_liv_rib != -1:
-            rib_map = {}
-            col_nom_liv = df_livreur.columns[idx_liv_nom]
-            col_rib_liv = df_livreur.columns[idx_liv_rib]
-            
-            for _, r in df_livreur.iterrows():
-                n = normalize_driver_name(r[col_nom_liv])
-                if n: rib_map[n] = r[col_rib_liv]
-            
-            # Appliquer sur df_concat
-            # On cherche les colonnes cibles
-            main_cols_norm = [normalize_label(c) for c in df_concat.columns]
-            idx_target_nom = next((i for i, c in enumerate(main_cols_norm) if c == "driver name"), -1)
-            idx_target_rib = next((i for i, c in enumerate(main_cols_norm) if c == "rib"), -1)
-            
-            if idx_target_nom != -1 and idx_target_rib != -1:
-                col_t_nom = df_concat.columns[idx_target_nom]
-                col_t_rib = df_concat.columns[idx_target_rib]
-                
-                # Fonction appliquée ligne par ligne pour update RIB si vide ou diff
-                def update_rib(row):
-                    n = normalize_driver_name(row[col_t_nom])
-                    if n in rib_map:
-                        return rib_map[n]
-                    return row[col_t_rib]
-                
-                df_concat[col_t_rib] = df_concat.apply(update_rib, axis=1)
-
     return df_concat, log_report
 
-def update_locations_only(df_data, commission_map):
-    """Fonction outil : Mettre à jour les locations manquantes."""
-    cols_norm = [normalize_label(c) for c in df_data.columns]
-    idx_restau = next((i for i, c in enumerate(cols_norm) if c in ['restaurant name','nom du restaurant','restaurant']), -1)
-    idx_loc = next((i for i, c in enumerate(cols_norm) if c in ['location','adresse','zone','ville']), -1)
-    
-    if idx_restau == -1:
-        return df_data, "Colonne Restaurant introuvable."
-    
-    # Si colonne Location n'existe pas, on l'ajoute
-    col_loc_name = "Location"
-    if idx_loc != -1:
-        col_loc_name = df_data.columns[idx_loc]
-    else:
-        df_data[col_loc_name] = pd.NA
-
-    col_restau_name = df_data.columns[idx_restau]
-    count = 0
-    
-    for i, row in df_data.iterrows():
-        restau = str(row[col_restau_name]).lower().strip()
-        current_loc = str(row[col_loc_name]) if pd.notna(row[col_loc_name]) else ""
-        
-        # On met à jour si la map a une info et que c'est pertinent (ou écrasement)
-        # Le script GAS faisait une mise à jour systématique si trouvé dans map
-        if restau in commission_map:
-            new_loc = commission_map[restau]['location']
-            if new_loc and new_loc != current_loc:
-                df_data.at[i, col_loc_name] = new_loc
-                count += 1
-                
-    return df_data, f"{count} locations mises à jour."
-
 # ==========================================
-# 4. INTERFACE STREAMLIT
+# 4. INTERFACE
 # ==========================================
 
-st.title("🚀 Importateur Excel/CSV (Style Yassir)")
+st.title("🚀 Importateur Yassir (Avance/Crédit/Data)")
 
-st.sidebar.header("📁 Fichiers de Référence")
-st.sidebar.markdown("Chargez d'abord l'état actuel de vos données.")
+st.sidebar.header("📁 Fichiers Maîtres")
+uploaded_data = st.sidebar.file_uploader("1. Fichier Data (Ex: Data 1314012026.csv)", type=['xlsx', 'csv'])
+uploaded_comm = st.sidebar.file_uploader("2. Fichier Commission (Optionnel)", type=['xlsx', 'csv'])
 
-uploaded_data = st.sidebar.file_uploader("1. Fichier Data (Base de données actuelle)", type=['xlsx', 'csv'])
-uploaded_comm = st.sidebar.file_uploader("2. Fichier Commission", type=['xlsx', 'csv'])
-uploaded_livreur = st.sidebar.file_uploader("3. Fichier Livreur (Optionnel)", type=['xlsx', 'csv'])
+if 'main_df' not in st.session_state: st.session_state['main_df'] = pd.DataFrame()
+if 'comm_map' not in st.session_state: st.session_state['comm_map'] = {}
 
-# Initialisation Session State
-if 'main_df' not in st.session_state:
-    st.session_state['main_df'] = pd.DataFrame()
-if 'comm_map' not in st.session_state:
-    st.session_state['comm_map'] = {}
-if 'livreur_df' not in st.session_state:
-    st.session_state['livreur_df'] = pd.DataFrame()
-
-# Chargement des données sidebar
-if st.sidebar.button("Charger les références"):
+if st.sidebar.button("Charger les Maîtres"):
     if uploaded_data:
-        try:
-            if uploaded_data.name.endswith('.csv'):
-                st.session_state['main_df'] = pd.read_csv(uploaded_data)
-            else:
-                st.session_state['main_df'] = pd.read_excel(uploaded_data)
-            st.sidebar.success(f"Data chargée : {len(st.session_state['main_df'])} lignes")
-        except Exception as e:
-            st.sidebar.error(f"Erreur Data : {e}")
-
+        st.session_state['main_df'] = load_file_auto_separator(uploaded_data)
+        st.sidebar.success(f"Data chargée : {len(st.session_state['main_df'])} lignes")
     if uploaded_comm:
-        try:
-            df_c = pd.read_excel(uploaded_comm) if uploaded_comm.name.endswith('.xlsx') else pd.read_csv(uploaded_comm)
-            st.session_state['comm_map'] = get_commission_map(df_c)
-            st.sidebar.success(f"Commissions chargées : {len(st.session_state['comm_map'])} restos")
-        except Exception as e:
-            st.sidebar.error(f"Erreur Comms : {e}")
-            
-    if uploaded_livreur:
-        try:
-            st.session_state['livreur_df'] = pd.read_excel(uploaded_livreur) if uploaded_livreur.name.endswith('.xlsx') else pd.read_csv(uploaded_livreur)
-            st.sidebar.success("Livreurs chargés")
-        except: pass
+        st.session_state['comm_map'] = get_commission_map(load_file_auto_separator(uploaded_comm))
+        st.sidebar.success(f"Commissions chargées")
 
 st.divider()
 
 col1, col2 = st.columns([2, 1])
-
 with col1:
-    st.subheader("📥 Nouveaux Fichiers à Importer")
-    new_files = st.file_uploader("Sélectionnez les fichiers (Excel/CSV)", accept_multiple_files=True)
+    st.subheader("📥 Importer Avances & Crédits")
+    st.markdown("Sélectionnez `Avance Livreur...` et `Credit Livreur...` ici.")
+    new_files = st.file_uploader("Fichiers à traiter", accept_multiple_files=True)
 
-    if st.button("🚀 Lancer l'importation", type="primary"):
+    if st.button("🚀 Lancer l'import", type="primary"):
         if st.session_state['main_df'].empty:
-            st.warning("Veuillez d'abord charger le fichier Data dans la barre latérale.")
+            st.error("Chargez d'abord le fichier 'Data' dans la barre latérale gauche !")
         elif not new_files:
-            st.warning("Aucun nouveau fichier sélectionné.")
+            st.warning("Aucun fichier sélectionné.")
         else:
-            with st.spinner("Traitement en cours..."):
+            with st.spinner("Analyse et fusion..."):
                 updated_df, report = process_import(
                     st.session_state['main_df'], 
                     new_files, 
-                    st.session_state['comm_map'],
-                    st.session_state['livreur_df']
+                    st.session_state['comm_map']
                 )
-                
                 st.session_state['main_df'] = updated_df
-                
-                st.success("Importation terminée !")
-                st.expander("Voir le rapport détaillé").write("\n".join(report))
+                st.success("Terminé !")
+                st.info("\n".join(report))
 
 with col2:
-    st.subheader("🔧 Outils")
-    if st.button("🔄 Mettre à jour les Locations"):
-        if st.session_state['main_df'].empty:
-            st.warning("Pas de données chargées.")
-        elif not st.session_state['comm_map']:
-            st.warning("Pas de fichier Commission chargé.")
-        else:
-            updated_df, msg = update_locations_only(st.session_state['main_df'], st.session_state['comm_map'])
-            st.session_state['main_df'] = updated_df
-            st.info(msg)
-
-st.divider()
-
-st.subheader("📊 Résultat (Aperçu)")
-if not st.session_state['main_df'].empty:
-    st.dataframe(st.session_state['main_df'].head(50))
-    
-    # Export
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-        st.session_state['main_df'].to_excel(writer, index=False, sheet_name='Data')
+    st.subheader("Téléchargement")
+    if not st.session_state['main_df'].empty:
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+            st.session_state['main_df'].to_excel(writer, index=False, sheet_name='Data')
         
-    st.download_button(
-        label="💾 Télécharger le fichier Data mis à jour (Excel)",
-        data=buffer.getvalue(),
-        file_name=f"Data_Updated_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-        mime="application/vnd.ms-excel"
-    )
-else:
-    st.info("Aucune donnée à afficher.")
+        st.download_button(
+            label="💾 Télécharger Data mise à jour",
+            data=buffer.getvalue(),
+            file_name=f"Data_Updated_{datetime.now().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.ms-excel"
+        )

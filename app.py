@@ -5,7 +5,7 @@ import re
 import io
 from datetime import datetime
 
-st.set_page_config(page_title="Calcul Paie - Logique Exacte", layout="wide")
+st.set_page_config(page_title="Calcul Paie - Logique Comptable", layout="wide")
 
 # ==========================================
 # 1. OUTILS DE NETTOYAGE
@@ -14,7 +14,9 @@ st.set_page_config(page_title="Calcul Paie - Logique Exacte", layout="wide")
 def clean_phone(val):
     if pd.isna(val) or val == "": return ""
     s = str(val)
+    # On garde uniquement les chiffres
     s = re.sub(r'[^0-9]', '', s)
+    
     if s.startswith("00"): s = s[2:]
     if s.startswith("212"): s = "+" + s
     elif s.startswith("0"): s = "+212" + s[1:]
@@ -41,25 +43,27 @@ def load_data(file):
     except: return pd.DataFrame()
 
 # ==========================================
-# 2. MOTEUR DE CALCUL
+# 2. MOTEUR DE CALCUL (LOGIQUE FLUX)
 # ==========================================
 
 def generate_report(df_data, df_avance, df_credit, df_ribs, df_restos_diff):
     
-    # 1. PRÉPARATION
+    # --- PRÉPARATION ---
     df_data['phone_clean'] = df_data['driver Phone'].apply(clean_phone)
     df_data['resto_clean'] = df_data['restaurant name'].astype(str).str.lower().str.strip()
     
     # Conversion Argent
     cols_money = ['driver payout', 'amount to restaurant', 'coupon discount', 
-                  'Bonus Amount', 'Payment Guarantee', 'Recovered Amount']
+                  'Driver Cash Co', 'Bonus Amount', 'Payment Guarantee', 'Recovered Amount',
+                  'delivery amount', 'service charge']
     for c in cols_money:
         if c in df_data.columns: df_data[c] = df_data[c].apply(parse_money)
         else: df_data[c] = 0.0
 
-    # Liste Restos Différés
+    # Restos Différés (Set)
     deferred_set = set()
     if not df_restos_diff.empty:
+        # On prend la première colonne du fichier resto
         col_name = df_restos_diff.columns[0]
         deferred_set = set(df_restos_diff[col_name].astype(str).str.lower().str.strip())
 
@@ -74,47 +78,39 @@ def generate_report(df_data, df_avance, df_credit, df_ribs, df_restos_diff):
     # Filtre Annulé
     df = df_data[~df_data['status'].str.contains("Cancelled", case=False, na=False)].copy()
 
-    # 2. CALCUL PAR LIVREUR
+    # --- CALCUL ---
     rows = []
     
     for phone, group in df.groupby('phone_clean'):
         if not phone: continue
         name = group['driver name'].iloc[0]
         
-        # --- TYPOLOGIE ---
+        # 1. Identifier les commandes où le livreur NE PAIE PAS le resto
         pay_method = group['Payment Method'].astype(str)
+        
         is_payzone = pay_method.str.contains('PAYZONE', case=False, na=False)
         is_meth_def = pay_method.str.contains('Deferred|Corporate|Différé', case=False, na=False)
         is_resto_def = group['resto_clean'].isin(deferred_set)
         
-        # Différé (Livreur encaisse Cash mais paie 0 Resto)
-        is_deferred = is_meth_def | is_resto_def
+        # "No-Pay" : Commandes où l'argent ne sort pas de la poche du livreur vers le resto
+        is_no_pay_resto = is_payzone | is_meth_def | is_resto_def
         
-        # Cash Normal (Livreur encaisse Cash et paie Resto)
-        is_cash_normal = (~is_payzone) & (~is_deferred)
+        # 2. Correction du Cash Co (La vérité comptable)
+        raw_cash_co = group['Driver Cash Co'].sum()
         
-        # --- CALCULS EXACTS (SELON SS.CSV) ---
+        # Le système a déduit le prix du resto du Cash Co. 
+        # Pour les commandes "No-Pay", le livreur n'a rien payé.
+        # Donc le système a déduit à tort. On rajoute ce montant pour corriger.
+        correction = group.loc[is_no_pay_resto, 'amount to restaurant'].sum()
         
-        # 1. Commissions : On paie seulement PAYZONE
-        # (Car en Cash et en Différé, il a gardé le cash, donc il s'est payé tout seul)
-        comm_payzone = group.loc[is_payzone, 'driver payout'].sum()
+        corrected_cash_co = raw_cash_co + correction
         
-        # 2. Coupons : On rembourse seulement sur le CASH NORMAL
-        # (C'est là où il a perdu de l'argent de sa poche)
-        coupon_reimb = group.loc[is_cash_normal, 'coupon discount'].sum()
+        # 3. Calcul de ce que Yassir doit (Solde Ops)
+        # Si CashCo est négatif (ex: -100), ça veut dire que le livreur a avancé 100. Yassir lui doit 100.
+        # Donc Solde = -1 * CashCo.
+        solde_ops = -1 * corrected_cash_co
         
-        # 3. Bonus, Garantie, Recovered
-        bonus = group['Bonus Amount'].sum()
-        guarantee = group['Payment Guarantee'].sum() if 'Payment Guarantee' in group.columns else 0
-        recovered = group['Recovered Amount'].sum() if 'Recovered Amount' in group.columns else 0
-        
-        # 4. Somme de base (Gains positifs)
-        solde_base = comm_payzone + coupon_reimb + bonus + guarantee + recovered
-        
-        # Infos pour affichage
-        payout_total = group['driver payout'].sum()
-        amt_rest_yassir = group.loc[is_payzone | is_deferred, 'amount to restaurant'].sum()
-        
+        # 4. Infos Annexes
         rib = rib_map.get(phone, "")
         if not rib and 'RIB' in group.columns:
             r = group['RIB'].dropna().unique()
@@ -125,25 +121,19 @@ def generate_report(df_data, df_avance, df_credit, df_ribs, df_restos_diff):
             'driver name': name,
             'RIB': str(rib).replace(" ", ""),
             'Total Orders': len(group),
-            'Deferred Orders': is_deferred.sum(),
-            'Payzone Orders': is_payzone.sum(),
-            
-            # Colonnes informatives
-            'Yassir driver payout': payout_total, 
-            'Yassir amount to restaurant': amt_rest_yassir,
-            'Yassir coupon discount': coupon_reimb,
-            'Payment Guarantee': guarantee,
-            'Bonus Value': bonus,
-            'Recovered Amount': recovered,
-            
-            # Colonne cachée pour le calcul
-            '_Solde_Base': solde_base
+            'Payzone/Deferred': is_no_pay_resto.sum(),
+            'Yassir driver payout': group['driver payout'].sum(),
+            'Yassir amount to restaurant': group.loc[is_no_pay_resto, 'amount to restaurant'].sum(),
+            'Bonus Value': group['Bonus Amount'].sum(),
+            'Payment Guarantee': group['Payment Guarantee'].sum() if 'Payment Guarantee' in group.columns else 0,
+            'Recovered Amount': group['Recovered Amount'].sum() if 'Recovered Amount' in group.columns else 0,
+            '_Solde_Ops': solde_ops
         })
 
     res = pd.DataFrame(rows)
     if res.empty: return pd.DataFrame()
 
-    # 3. FUSION AVANCE / CREDIT
+    # --- FUSION AVANCE / CREDIT ---
     if not df_avance.empty:
         c_av_ph = next((c for c in df_avance.columns if 'phone' in str(c).lower()), df_avance.columns[-1])
         c_av_mt = next((c for c in df_avance.columns if 'avance' in str(c).lower()), df_avance.columns[1])
@@ -161,15 +151,18 @@ def generate_report(df_data, df_avance, df_credit, df_ribs, df_restos_diff):
     res['Avance payé'] = res.get('Avance payé', 0).fillna(0)
     res['Credit Balance'] = res.get('Credit Balance', 0).fillna(0)
 
-    # 4. SOLDE FINAL
+    # --- SOLDE FINAL ---
     res['Total Amount (Driver Solde)'] = (
-        res['_Solde_Base'] + 
-        res['Credit Balance'] - 
+        res['_Solde_Ops'] + 
+        res['Bonus Value'] + 
+        res['Credit Balance'] + 
+        res['Payment Guarantee'] + 
+        res['Recovered Amount'] - 
         res['Avance payé']
     )
 
-    cols = ['driver Phone','driver name','RIB','Total Orders','Deferred Orders','Payzone Orders',
-            'Yassir driver payout','Yassir amount to restaurant','Yassir coupon discount',
+    cols = ['driver Phone','driver name','RIB','Total Orders','Payzone/Deferred',
+            'Yassir driver payout','Yassir amount to restaurant',
             'Payment Guarantee','Bonus Value','Credit Balance','Recovered Amount',
             'Avance payé','Total Amount (Driver Solde)']
             
@@ -190,11 +183,10 @@ with col2:
 
 if st.button("CALCULER"):
     if f_d:
-        with st.spinner("Calcul en cours..."):
+        with st.spinner("Calcul Comptable en cours..."):
             d = load_data(f_d)
             a = load_data(f_a)
             c = load_data(f_c)
-            # Correction variable shadowing ici
             df_restos = load_data(f_r)
             r_rib = load_data(f_rib)
             
@@ -208,4 +200,4 @@ if st.button("CALCULER"):
                     final.to_excel(writer, index=False)
                 st.download_button("Télécharger Excel", buffer.getvalue(), "Paie_Finale.xlsx")
             else:
-                st.error("Fichier Data vide.")
+                st.error("Données vides.")

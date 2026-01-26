@@ -9,7 +9,7 @@ st.set_page_config(page_title="Driver Payout Calculator", layout="wide")
 st.title("💰 Driver Payout Calculator")
 st.markdown("""
 This platform calculates the final payouts for delivery agents based on your specific business rules.
-Please upload the required files below.
+**Updates:** Bonus added to 'Cash/Instant' and 'Card/Instant' logic.
 """)
 
 # --- 1. File Uploaders ---
@@ -88,22 +88,24 @@ def calculate_order_payout(row, cash_co_ids):
     if is_cash:
         if is_instant:
             # Form 3: Partner Instant (Driver pays Resto, gets paid by Customer)
-            # User Formula: Total D - Resto Comm - Service Charge + Driver Payout
+            # Formula: Total D - Resto Comm - Service Charge + Driver Payout + BONUS
             # Total D = Item Total + Driver Payout + Service Charge
             total_d = item_total + driver_payout + service_charge
-            return total_d - resto_comm - service_charge + driver_payout
+            return (total_d - resto_comm - service_charge + driver_payout) + bonus
         else:
             # Form 4: Cash Co (Driver pays nothing to Resto)
-            # User Formula: Driver Payout + Bonus
+            # Formula: Driver Payout + Bonus
             return driver_payout + bonus
 
     # Form 5: Card Payment (Implied from text)
     if is_card: # Or any non-cash method
         if is_instant:
-            # User Formula: Driver Payout + Item Total - Resto Comm - Service Charge
-            return driver_payout + item_total - resto_comm - service_charge
+            # Case 5a: Partner Instant (Driver pays Resto with own cash)
+            # Formula: Driver Payout + Item Total - Resto Comm - Service Charge + BONUS
+            return (driver_payout + item_total - resto_comm - service_charge) + bonus
         else:
-            # User Formula: Driver Payout + Bonus
+            # Case 5b: 15-Day Payment
+            # Formula: Driver Payout + Bonus
             return driver_payout + bonus
 
     # Fallback
@@ -129,6 +131,7 @@ if uploaded_main_files:
             df_cash = load_file(uploaded_cash_co)
             # Assume first column is ID
             if df_cash is not None:
+                # Make sure we convert to string to match logic
                 cash_co_ids = set(df_cash.iloc[:, 0].astype(str))
                 st.info(f"Loaded {len(cash_co_ids)} Cash Co (15-day) Restaurants.")
 
@@ -156,8 +159,6 @@ if uploaded_main_files:
             df_adv = load_file(uploaded_advance)
             if df_adv is not None:
                 # Expecting columns like Phone/Name and Amount
-                # We'll try to find a phone column or match by name
-                # For simplicity, let's assume column 0 is ID (Phone) and column 1 is Amount
                 df_adv['clean_phone'] = df_adv.iloc[:, 0].apply(clean_phone)
                 df_adv['Advance Amount'] = pd.to_numeric(df_adv.iloc[:, 1], errors='coerce').fillna(0)
                 
@@ -183,8 +184,13 @@ if uploaded_main_files:
             if df_rib is not None:
                 df_rib['clean_phone'] = df_rib.iloc[:, 0].apply(clean_phone)
                 # Assume RIB is col 1, maybe Bank Name col 2
-                df_rib = df_rib.iloc[:, :3] # Take first 3 cols
-                df_rib.columns = ['clean_phone', 'RIB', 'Bank'] if len(df_rib.columns) >=3 else ['clean_phone', 'RIB'] + [f'Col_{i}' for i in range(len(df_rib.columns)-2)]
+                # Ensure we don't crash if file has fewer columns
+                cols_to_take = min(3, len(df_rib.columns))
+                df_rib = df_rib.iloc[:, :cols_to_take] 
+                
+                # Rename for clarity
+                new_cols = ['clean_phone', 'RIB', 'Bank']
+                df_rib.columns = new_cols[:cols_to_take]
                 
                 # Deduplicate RIBs
                 df_rib = df_rib.drop_duplicates(subset=['clean_phone'])
@@ -220,7 +226,11 @@ if uploaded_main_files:
         if selected_driver:
             driver_orders = df[df['driver name'] == selected_driver]
             st.write(f"Orders for {selected_driver}:")
-            st.dataframe(driver_orders[['order id', 'order time', 'restaurant name', 'Payment Method', 'item total', 'driver payout', 'Calculated Payout']])
+            # Show relevant columns including debug info
+            cols_to_show = ['order id', 'order time', 'restaurant name', 'Payment Method', 'item total', 'driver payout', 'Bonus Amount', 'Calculated Payout']
+            # Only show columns that exist
+            cols_to_show = [c for c in cols_to_show if c in driver_orders.columns]
+            st.dataframe(driver_orders[cols_to_show])
 
     else:
         st.warning("No valid data found in uploaded files.")

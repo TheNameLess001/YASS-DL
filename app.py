@@ -9,7 +9,7 @@ st.set_page_config(page_title="Driver Payout Calculator", layout="wide")
 st.title("💰 Driver Payout Calculator")
 st.markdown("""
 This platform calculates the final payouts for delivery agents.
-**Correction:** Case 3 (Cash + Instant) now excludes 'Item Total' from payout to avoid double payment.
+**Status:** Fixed 'AttributeError' by safely handling missing Advance/Credit columns.
 """)
 
 # --- 1. File Uploaders ---
@@ -30,6 +30,7 @@ def load_file(uploaded_file):
         if uploaded_file.name.endswith('.csv'):
             uploaded_file.seek(0)
             df = pd.read_csv(uploaded_file, sep=',')
+            # If separator detection failed (only 1 col), try semicolon
             if df.shape[1] < 2:
                 uploaded_file.seek(0)
                 df = pd.read_csv(uploaded_file, sep=';')
@@ -89,19 +90,18 @@ def calculate_order_payout(row, cash_co_ids):
     if is_cash:
         if is_instant:
             # Case 3: Partner Instant (Driver pays Resto, Collects Cash)
-            # Driver already has the Cash from customer. 
-            # Payout = Earnings only.
+            # Payout = Earnings only (since he keeps cash difference)
             return driver_payout + bonus
         else:
             # Case 4: Cash Co (Driver pays nothing, Collects Cash)
-            # Payout = Earnings only.
+            # Payout = Earnings only
             return driver_payout + bonus
 
     # Form 5: Card Payment
     if is_card: 
         if is_instant:
-            # Case 5a: Partner Instant (Driver pays Resto with own funds, gets NO Cash)
-            # Payout = Earnings + Reimbursement of what he paid.
+            # Case 5a: Partner Instant (Driver pays Resto with own funds)
+            # Payout = Earnings + Reimbursement
             return (driver_payout + item_total - resto_comm - service_charge) + bonus
         else:
             # Case 5b: 15-Day Payment
@@ -153,8 +153,9 @@ if uploaded_main_files:
                     st.stop()
                 
                 s_date, e_date = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
+                # Inclusive filtering
                 df = df[(df['temp_date'] >= s_date) & (df['temp_date'] <= e_date)].copy()
-                st.success(f"Filtered {len(df)} orders.")
+                st.success(f"Filtered {len(df)} orders from {s_date.date()} to {e_date.date()}.")
             else:
                 st.warning("Date parsing failed. Showing all data.")
 
@@ -218,9 +219,17 @@ if uploaded_main_files:
                     driver_stats = pd.merge(driver_stats, df_rib_c, on='clean_name', how='left')
 
         # --- Final Net ---
-        driver_stats['Advance Amount'] = driver_stats.get('Advance Amount', 0).fillna(0)
-        driver_stats['Credit Amount'] = driver_stats.get('Credit Amount', 0).fillna(0)
-        # Note: Usually Credits are POSITIVE debts. If negative in file, logic handles it naturally.
+        # Safe filling of missing columns
+        if 'Advance Amount' not in driver_stats.columns:
+            driver_stats['Advance Amount'] = 0.0
+        else:
+            driver_stats['Advance Amount'] = driver_stats['Advance Amount'].fillna(0)
+            
+        if 'Credit Amount' not in driver_stats.columns:
+            driver_stats['Credit Amount'] = 0.0
+        else:
+            driver_stats['Credit Amount'] = driver_stats['Credit Amount'].fillna(0)
+        
         driver_stats['Final Net Payout'] = driver_stats['Base Earnings'] - driver_stats['Advance Amount'] - driver_stats['Credit Amount']
         
         # Show
@@ -229,6 +238,7 @@ if uploaded_main_files:
         if rib_c: cols.append(rib_c)
         cols = [c for c in cols if c in driver_stats.columns]
         
+        st.subheader("Final Driver Payouts")
         st.dataframe(driver_stats[cols])
         
         st.download_button("Download CSV", driver_stats[cols].to_csv(index=False).encode('utf-8'), "driver_payouts.csv", "text/csv")

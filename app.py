@@ -9,31 +9,35 @@ st.set_page_config(page_title="Driver Payout Calculator", layout="wide")
 st.title("💰 Driver Payout Calculator")
 st.markdown("""
 This platform calculates the final payouts for delivery agents based on your specific business rules.
-**Updates:** Bonus added to 'Cash/Instant' and 'Card/Instant' logic.
+**Updates:** Adapted to specific file formats (CASH-CO, Avance, Credit, RIB).
 """)
 
 # --- 1. File Uploaders ---
 st.sidebar.header("1. Upload Data Files")
 
 uploaded_main_files = st.sidebar.file_uploader("Upload Orders Files (CSV/Excel)", accept_multiple_files=True, type=['csv', 'xlsx'])
-uploaded_cash_co = st.sidebar.file_uploader("Upload Cash Co / 15-Day Resto File", type=['csv', 'xlsx'])
-uploaded_advance = st.sidebar.file_uploader("Upload Advances File", type=['csv', 'xlsx'])
-uploaded_credit = st.sidebar.file_uploader("Upload Credits File", type=['csv', 'xlsx'])
-uploaded_rib = st.sidebar.file_uploader("Upload Driver RIB File", type=['csv', 'xlsx'])
+uploaded_cash_co = st.sidebar.file_uploader("Upload Cash Co / 15-Day Resto File (CASH-CO)", type=['csv', 'xlsx'])
+uploaded_advance = st.sidebar.file_uploader("Upload Advances File (Avance Livreur)", type=['csv', 'xlsx'])
+uploaded_credit = st.sidebar.file_uploader("Upload Credits File (Credit Livreur)", type=['csv', 'xlsx'])
+uploaded_rib = st.sidebar.file_uploader("Upload Driver RIB File (Delivery guys RIB)", type=['csv', 'xlsx'])
 
 # --- 2. Helper Functions ---
 
-def load_file(uploaded_file):
+def load_file(uploaded_file, sep=None):
     if uploaded_file is None:
         return None
     try:
+        # If csv, try to detect separator or use provided
         if uploaded_file.name.endswith('.csv'):
-            # Try reading with semi-colon first (common in the sample), then comma
+            if sep:
+                return pd.read_csv(uploaded_file, sep=sep)
             try:
-                return pd.read_csv(uploaded_file, sep=';')
+                # Default try with comma
+                return pd.read_csv(uploaded_file)
             except:
+                # Fallback to semicolon
                 uploaded_file.seek(0)
-                return pd.read_csv(uploaded_file, sep=',')
+                return pd.read_csv(uploaded_file, sep=';')
         else:
             return pd.read_excel(uploaded_file)
     except Exception as e:
@@ -46,6 +50,12 @@ def clean_phone(phone):
         return ""
     s = str(phone).replace(" ", "").replace("-", "").replace(".", "")
     return s
+
+def clean_name(name):
+    """Normalize names for merging (lowercase, strip)."""
+    if pd.isna(name):
+        return ""
+    return str(name).strip().lower()
 
 def calculate_order_payout(row, cash_co_ids):
     """
@@ -88,8 +98,7 @@ def calculate_order_payout(row, cash_co_ids):
     if is_cash:
         if is_instant:
             # Form 3: Partner Instant (Driver pays Resto, gets paid by Customer)
-            # Formula: Total D - Resto Comm - Service Charge + Driver Payout + BONUS
-            # Total D = Item Total + Driver Payout + Service Charge
+            # Formula: (Total D - Resto Comm - Service Charge + Driver Payout) + BONUS
             total_d = item_total + driver_payout + service_charge
             return (total_d - resto_comm - service_charge + driver_payout) + bonus
         else:
@@ -97,11 +106,11 @@ def calculate_order_payout(row, cash_co_ids):
             # Formula: Driver Payout + Bonus
             return driver_payout + bonus
 
-    # Form 5: Card Payment (Implied from text)
-    if is_card: # Or any non-cash method
+    # Form 5: Card Payment
+    if is_card: 
         if is_instant:
             # Case 5a: Partner Instant (Driver pays Resto with own cash)
-            # Formula: Driver Payout + Item Total - Resto Comm - Service Charge + BONUS
+            # Formula: (Driver Payout + Item Total - Resto Comm - Service Charge) + BONUS
             return (driver_payout + item_total - resto_comm - service_charge) + bonus
         else:
             # Case 5b: 15-Day Payment
@@ -117,7 +126,8 @@ if uploaded_main_files:
     # Load Main Data
     df_list = []
     for f in uploaded_main_files:
-        d = load_file(f)
+        # Main export usually uses semicolon
+        d = load_file(f, sep=';')
         if d is not None:
             df_list.append(d)
     
@@ -125,15 +135,18 @@ if uploaded_main_files:
         df = pd.concat(df_list, ignore_index=True)
         st.success(f"Loaded {len(df)} orders from {len(uploaded_main_files)} files.")
         
-        # Load Cash Co IDs
+        # --- Load Cash Co (15 Day) ---
         cash_co_ids = set()
         if uploaded_cash_co:
             df_cash = load_file(uploaded_cash_co)
-            # Assume first column is ID
             if df_cash is not None:
-                # Make sure we convert to string to match logic
-                cash_co_ids = set(df_cash.iloc[:, 0].astype(str))
-                st.info(f"Loaded {len(cash_co_ids)} Cash Co (15-day) Restaurants.")
+                # Clean column names
+                df_cash.columns = df_cash.columns.str.strip()
+                if 'Restaurant ID' in df_cash.columns:
+                    cash_co_ids = set(df_cash['Restaurant ID'].astype(str))
+                    st.info(f"Loaded {len(cash_co_ids)} Cash Co (15-day) Restaurants.")
+                else:
+                    st.error("Could not find 'Restaurant ID' column in Cash Co file.")
 
         # --- Calculate Payouts ---
         st.subheader("Processing Orders...")
@@ -141,77 +154,97 @@ if uploaded_main_files:
         # Apply calculation
         df['Calculated Payout'] = df.apply(lambda row: calculate_order_payout(row, cash_co_ids), axis=1)
         
-        # Group by Driver
-        # We use 'driver Phone' as unique key, cleaning it first
+        # Prepare for Aggregation
         df['clean_phone'] = df['driver Phone'].apply(clean_phone)
+        df['clean_name'] = df['driver name'].apply(clean_name)
         
-        # Aggregation
-        driver_stats = df.groupby(['clean_phone', 'driver name']).agg({
+        # Aggregation by Phone AND Name (to keep name in result)
+        driver_stats = df.groupby(['clean_phone', 'clean_name', 'driver name']).agg({
             'order id': 'count',
             'Calculated Payout': 'sum'
         }).reset_index()
+        
         driver_stats.rename(columns={'order id': 'Total Orders', 'Calculated Payout': 'Base Earnings'}, inplace=True)
         
         # --- Merge External Files ---
         
-        # 1. Advances
+        # 1. Advances (Avance Livreur)
         if uploaded_advance:
-            df_adv = load_file(uploaded_advance)
+            # Usually semicolon separated based on snippet
+            df_adv = load_file(uploaded_advance, sep=';')
             if df_adv is not None:
-                # Expecting columns like Phone/Name and Amount
-                df_adv['clean_phone'] = df_adv.iloc[:, 0].apply(clean_phone)
-                df_adv['Advance Amount'] = pd.to_numeric(df_adv.iloc[:, 1], errors='coerce').fillna(0)
+                # Clean columns: ' driver Phone ' -> 'driver Phone'
+                df_adv.columns = df_adv.columns.str.strip()
                 
-                # Group in case of duplicates
-                adv_grouped = df_adv.groupby('clean_phone')['Advance Amount'].sum().reset_index()
-                
-                driver_stats = pd.merge(driver_stats, adv_grouped, on='clean_phone', how='left')
+                if 'driver Phone' in df_adv.columns and 'Avance' in df_adv.columns:
+                    df_adv['clean_phone'] = df_adv['driver Phone'].apply(clean_phone)
+                    df_adv['Avance'] = pd.to_numeric(df_adv['Avance'], errors='coerce').fillna(0)
+                    
+                    adv_grouped = df_adv.groupby('clean_phone')['Avance'].sum().reset_index()
+                    adv_grouped.rename(columns={'Avance': 'Advance Amount'}, inplace=True)
+                    
+                    driver_stats = pd.merge(driver_stats, adv_grouped, on='clean_phone', how='left')
+                else:
+                    st.warning("Advance file must have 'driver Phone' and 'Avance' columns.")
         
-        # 2. Credits
+        # 2. Credits (Credit Livreur)
         if uploaded_credit:
-            df_cred = load_file(uploaded_credit)
+            # Usually semicolon separated
+            df_cred = load_file(uploaded_credit, sep=';')
             if df_cred is not None:
-                df_cred['clean_phone'] = df_cred.iloc[:, 0].apply(clean_phone)
-                df_cred['Credit Amount'] = pd.to_numeric(df_cred.iloc[:, 1], errors='coerce').fillna(0)
+                df_cred.columns = df_cred.columns.str.strip()
                 
-                cred_grouped = df_cred.groupby('clean_phone')['Credit Amount'].sum().reset_index()
-                
-                driver_stats = pd.merge(driver_stats, cred_grouped, on='clean_phone', how='left')
+                if 'driver Phone' in df_cred.columns and 'amount' in df_cred.columns:
+                    df_cred['clean_phone'] = df_cred['driver Phone'].apply(clean_phone)
+                    
+                    # Handle comma decimal if present (e.g. 27,558)
+                    if df_cred['amount'].dtype == object:
+                        df_cred['amount'] = df_cred['amount'].str.replace(',', '.').astype(float)
+                    
+                    df_cred['Credit Amount'] = pd.to_numeric(df_cred['amount'], errors='coerce').fillna(0)
+                    
+                    cred_grouped = df_cred.groupby('clean_phone')['Credit Amount'].sum().reset_index()
+                    
+                    driver_stats = pd.merge(driver_stats, cred_grouped, on='clean_phone', how='left')
+                else:
+                    st.warning("Credit file must have 'driver Phone' and 'amount' columns.")
 
-        # 3. RIB
+        # 3. RIB (Delivery guys RIB)
         if uploaded_rib:
-            df_rib = load_file(uploaded_rib)
+            # Usually comma separated
+            df_rib = load_file(uploaded_rib) # Auto-detect or comma
             if df_rib is not None:
-                df_rib['clean_phone'] = df_rib.iloc[:, 0].apply(clean_phone)
-                # Assume RIB is col 1, maybe Bank Name col 2
-                # Ensure we don't crash if file has fewer columns
-                cols_to_take = min(3, len(df_rib.columns))
-                df_rib = df_rib.iloc[:, :cols_to_take] 
-                
-                # Rename for clarity
-                new_cols = ['clean_phone', 'RIB', 'Bank']
-                df_rib.columns = new_cols[:cols_to_take]
-                
-                # Deduplicate RIBs
-                df_rib = df_rib.drop_duplicates(subset=['clean_phone'])
-                
-                driver_stats = pd.merge(driver_stats, df_rib, on='clean_phone', how='left')
+                df_rib.columns = df_rib.columns.str.strip()
+                # Snippet shows: 'Intitulé du compte' (Name), 'RIB'
+                if 'Intitulé du compte' in df_rib.columns and 'RIB' in df_rib.columns:
+                    df_rib['clean_name'] = df_rib['Intitulé du compte'].apply(clean_name)
+                    
+                    # Deduplicate: If same name has multiple RIBs, take first
+                    df_rib_clean = df_rib[['clean_name', 'RIB']].drop_duplicates(subset=['clean_name'])
+                    
+                    # Merge on NAME since RIB file has no phone
+                    driver_stats = pd.merge(driver_stats, df_rib_clean, on='clean_name', how='left')
+                else:
+                    st.warning("RIB file must have 'Intitulé du compte' and 'RIB' columns.")
 
         # --- Final Calculation ---
         # Fill NaNs
         driver_stats['Advance Amount'] = driver_stats.get('Advance Amount', 0).fillna(0)
         driver_stats['Credit Amount'] = driver_stats.get('Credit Amount', 0).fillna(0)
         
-        # Net Payout = Base Earnings - Advances - Credits
-        # (Assuming Advances/Credits are POSITIVE numbers representing debt)
+        # Net Payout
         driver_stats['Final Net Payout'] = driver_stats['Base Earnings'] - driver_stats['Advance Amount'] - driver_stats['Credit Amount']
         
-        # Formatting
+        # Formatting for Display
+        final_cols = ['driver name', 'clean_phone', 'Total Orders', 'Base Earnings', 'Advance Amount', 'Credit Amount', 'Final Net Payout', 'RIB']
+        # Only select cols that exist
+        final_cols = [c for c in final_cols if c in driver_stats.columns]
+        
         st.subheader("Final Driver Payouts")
-        st.dataframe(driver_stats)
+        st.dataframe(driver_stats[final_cols])
         
         # Download
-        csv = driver_stats.to_csv(index=False).encode('utf-8')
+        csv = driver_stats[final_cols].to_csv(index=False).encode('utf-8')
         st.download_button(
             label="Download Payout Report as CSV",
             data=csv,
@@ -219,16 +252,14 @@ if uploaded_main_files:
             mime='text/csv',
         )
         
-        # Optional: Show details for a specific driver
+        # Optional: Show details
         st.divider()
         st.subheader("Driver Detail View")
         selected_driver = st.selectbox("Select Driver", driver_stats['driver name'].unique())
         if selected_driver:
             driver_orders = df[df['driver name'] == selected_driver]
             st.write(f"Orders for {selected_driver}:")
-            # Show relevant columns including debug info
-            cols_to_show = ['order id', 'order time', 'restaurant name', 'Payment Method', 'item total', 'driver payout', 'Bonus Amount', 'Calculated Payout']
-            # Only show columns that exist
+            cols_to_show = ['order id', 'order time', 'restaurant name', 'Payment Method', 'status', 'item total', 'driver payout', 'Bonus Amount', 'Calculated Payout']
             cols_to_show = [c for c in cols_to_show if c in driver_orders.columns]
             st.dataframe(driver_orders[cols_to_show])
 

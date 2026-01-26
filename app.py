@@ -9,7 +9,7 @@ st.set_page_config(page_title="Driver Payout Calculator", layout="wide")
 st.title("💰 Driver Payout Calculator")
 st.markdown("""
 This platform calculates the final payouts for delivery agents based on your specific business rules.
-**Updates:** Adapted to specific file formats (CASH-CO, Avance, Credit, RIB).
+**Status:** Fixed 'driver Phone' column error by automatically cleaning column names.
 """)
 
 # --- 1. File Uploaders ---
@@ -27,19 +27,22 @@ def load_file(uploaded_file, sep=None):
     if uploaded_file is None:
         return None
     try:
-        # If csv, try to detect separator or use provided
         if uploaded_file.name.endswith('.csv'):
             if sep:
-                return pd.read_csv(uploaded_file, sep=sep)
-            try:
-                # Default try with comma
-                return pd.read_csv(uploaded_file)
-            except:
-                # Fallback to semicolon
-                uploaded_file.seek(0)
-                return pd.read_csv(uploaded_file, sep=';')
+                df = pd.read_csv(uploaded_file, sep=sep)
+            else:
+                try:
+                    df = pd.read_csv(uploaded_file)
+                except:
+                    uploaded_file.seek(0)
+                    df = pd.read_csv(uploaded_file, sep=';')
         else:
-            return pd.read_excel(uploaded_file)
+            df = pd.read_excel(uploaded_file)
+        
+        # KEY FIX: Clean column names immediately after loading
+        # This removes spaces like " driver Phone " -> "driver Phone"
+        df.columns = df.columns.str.strip()
+        return df
     except Exception as e:
         st.error(f"Error loading {uploaded_file.name}: {e}")
         return None
@@ -133,15 +136,21 @@ if uploaded_main_files:
     
     if df_list:
         df = pd.concat(df_list, ignore_index=True)
+        # Extra safety: strip columns again after concat
+        df.columns = df.columns.str.strip()
+        
         st.success(f"Loaded {len(df)} orders from {len(uploaded_main_files)} files.")
         
+        # --- Check for Critical Columns ---
+        if 'driver Phone' not in df.columns:
+            st.error(f"Column 'driver Phone' not found. Available columns: {list(df.columns)}")
+            st.stop()
+
         # --- Load Cash Co (15 Day) ---
         cash_co_ids = set()
         if uploaded_cash_co:
             df_cash = load_file(uploaded_cash_co)
             if df_cash is not None:
-                # Clean column names
-                df_cash.columns = df_cash.columns.str.strip()
                 if 'Restaurant ID' in df_cash.columns:
                     cash_co_ids = set(df_cash['Restaurant ID'].astype(str))
                     st.info(f"Loaded {len(cash_co_ids)} Cash Co (15-day) Restaurants.")
@@ -158,7 +167,7 @@ if uploaded_main_files:
         df['clean_phone'] = df['driver Phone'].apply(clean_phone)
         df['clean_name'] = df['driver name'].apply(clean_name)
         
-        # Aggregation by Phone AND Name (to keep name in result)
+        # Aggregation by Phone AND Name
         driver_stats = df.groupby(['clean_phone', 'clean_name', 'driver name']).agg({
             'order id': 'count',
             'Calculated Payout': 'sum'
@@ -170,12 +179,8 @@ if uploaded_main_files:
         
         # 1. Advances (Avance Livreur)
         if uploaded_advance:
-            # Usually semicolon separated based on snippet
             df_adv = load_file(uploaded_advance, sep=';')
             if df_adv is not None:
-                # Clean columns: ' driver Phone ' -> 'driver Phone'
-                df_adv.columns = df_adv.columns.str.strip()
-                
                 if 'driver Phone' in df_adv.columns and 'Avance' in df_adv.columns:
                     df_adv['clean_phone'] = df_adv['driver Phone'].apply(clean_phone)
                     df_adv['Avance'] = pd.to_numeric(df_adv['Avance'], errors='coerce').fillna(0)
@@ -185,15 +190,12 @@ if uploaded_main_files:
                     
                     driver_stats = pd.merge(driver_stats, adv_grouped, on='clean_phone', how='left')
                 else:
-                    st.warning("Advance file must have 'driver Phone' and 'Avance' columns.")
+                    st.warning(f"Advance file missing columns. Found: {list(df_adv.columns)}")
         
         # 2. Credits (Credit Livreur)
         if uploaded_credit:
-            # Usually semicolon separated
             df_cred = load_file(uploaded_credit, sep=';')
             if df_cred is not None:
-                df_cred.columns = df_cred.columns.str.strip()
-                
                 if 'driver Phone' in df_cred.columns and 'amount' in df_cred.columns:
                     df_cred['clean_phone'] = df_cred['driver Phone'].apply(clean_phone)
                     
@@ -207,15 +209,12 @@ if uploaded_main_files:
                     
                     driver_stats = pd.merge(driver_stats, cred_grouped, on='clean_phone', how='left')
                 else:
-                    st.warning("Credit file must have 'driver Phone' and 'amount' columns.")
+                    st.warning(f"Credit file missing columns. Found: {list(df_cred.columns)}")
 
         # 3. RIB (Delivery guys RIB)
         if uploaded_rib:
-            # Usually comma separated
-            df_rib = load_file(uploaded_rib) # Auto-detect or comma
+            df_rib = load_file(uploaded_rib)
             if df_rib is not None:
-                df_rib.columns = df_rib.columns.str.strip()
-                # Snippet shows: 'Intitulé du compte' (Name), 'RIB'
                 if 'Intitulé du compte' in df_rib.columns and 'RIB' in df_rib.columns:
                     df_rib['clean_name'] = df_rib['Intitulé du compte'].apply(clean_name)
                     
@@ -225,7 +224,7 @@ if uploaded_main_files:
                     # Merge on NAME since RIB file has no phone
                     driver_stats = pd.merge(driver_stats, df_rib_clean, on='clean_name', how='left')
                 else:
-                    st.warning("RIB file must have 'Intitulé du compte' and 'RIB' columns.")
+                    st.warning(f"RIB file missing columns. Found: {list(df_rib.columns)}")
 
         # --- Final Calculation ---
         # Fill NaNs

@@ -9,7 +9,7 @@ st.set_page_config(page_title="Driver Payout Calculator", layout="wide")
 st.title("💰 Driver Payout Calculator")
 st.markdown("""
 This platform calculates the final payouts for delivery agents.
-**Status:** Fixed 'AttributeError' by safely handling missing Advance/Credit columns.
+**Update:** Displays **Base Earnings** (before deductions) and **Final Net Payout** separately to help verify manual calculations.
 """)
 
 # --- 1. File Uploaders ---
@@ -85,11 +85,11 @@ def calculate_order_payout(row, cash_co_ids):
     
     # 1. Returned Orders: Always pays Item Total
     if is_returned:
-        return item_total
+        return item_total, "Returned"
 
     # 2. Yassir Market
     if is_yassir_market:
-        return driver_payout + bonus
+        return driver_payout + bonus, "Yassir Market"
 
     # 3. Cash Payment
     if is_cash:
@@ -97,25 +97,28 @@ def calculate_order_payout(row, cash_co_ids):
             # Case 3: Cash + Instant Restaurant
             # Balance = Earnings - (Net Cash Held - Coupon)
             # Result: Bonus + Coupon - Service - Commission
-            return bonus + coupon - service_charge - resto_comm
+            val = bonus + coupon - service_charge - resto_comm
+            return val, "Cash Instant"
         else:
             # Case 4: Cash + 15 Day (Cash Co)
             # Balance = Earnings - (Cash Held - Coupon)
             # Result: Bonus + Coupon - Item Total - Service
-            return bonus + coupon - item_total - service_charge
+            val = bonus + coupon - item_total - service_charge
+            return val, "Cash 15-Day"
 
-    # 4. Card Payment (Driver holds no cash)
+    # 4. Card Payment
     if is_card: 
         if is_instant:
             # Case 5a: Partner Instant
-            # Reimburse driver for paying resto
-            return (driver_payout + item_total - resto_comm - service_charge) + bonus
+            val = (driver_payout + item_total - resto_comm - service_charge) + bonus
+            return val, "Card Instant"
         else:
             # Case 5b: 15-Day Payment
-            return driver_payout + bonus
+            val = driver_payout + bonus
+            return val, "Card 15-Day"
 
     # Fallback
-    return driver_payout
+    return driver_payout, "Fallback"
 
 # --- 3. Main Execution ---
 
@@ -194,11 +197,16 @@ if uploaded_main_files:
 
         # --- 4. Calculate ---
         st.subheader("Processing...")
-        df['Calculated Payout'] = df.apply(lambda row: calculate_order_payout(row, cash_co_ids), axis=1)
+        
+        # Apply Logic and split result into Value and Type
+        results = df.apply(lambda row: calculate_order_payout(row, cash_co_ids), axis=1)
+        df['Calculated Payout'] = results.apply(lambda x: x[0])
+        df['Calculation Type'] = results.apply(lambda x: x[1])
         
         df['clean_phone'] = df[phone_col].apply(clean_phone)
         df['clean_name'] = df[name_col].apply(clean_name)
         
+        # Aggregate
         driver_stats = df.groupby(['clean_phone', 'clean_name', name_col]).agg({
             'order id': 'count',
             'Calculated Payout': 'sum'
@@ -240,7 +248,7 @@ if uploaded_main_files:
                     df_rib_c.columns = ['clean_name', 'RIB']
                     driver_stats = pd.merge(driver_stats, df_rib_c, on='clean_name', how='left')
 
-        # --- 6. Final Net (FIXED) ---
+        # --- 6. Final Net ---
         if 'Advance Amount' not in driver_stats.columns:
             driver_stats['Advance Amount'] = 0.0
         else:
@@ -251,6 +259,7 @@ if uploaded_main_files:
         else:
             driver_stats['Credit Amount'] = driver_stats['Credit Amount'].fillna(0)
         
+        # Calculate Final
         driver_stats['Final Net Payout'] = driver_stats['Base Earnings'] - driver_stats['Advance Amount'] - driver_stats['Credit Amount']
         
         # Show
@@ -266,11 +275,21 @@ if uploaded_main_files:
         
         # Details
         st.divider()
-        sel = st.selectbox("Select Driver for Details", driver_stats[name_col].unique())
+        st.subheader("🔍 Driver Detail View")
+        sel = st.selectbox("Select Driver to Inspect", driver_stats[name_col].unique())
         if sel:
+            # Show Stats
+            stats = driver_stats[driver_stats[name_col] == sel].iloc[0]
+            st.write(f"**Base Earnings:** {stats['Base Earnings']:.2f} MAD")
+            st.write(f"**- Advance:** {stats['Advance Amount']:.2f} MAD")
+            st.write(f"**- Credit:** {stats['Credit Amount']:.2f} MAD")
+            st.write(f"**= Net Payout:** {stats['Final Net Payout']:.2f} MAD")
+            
+            # Show Orders
             d_ord = df[df[name_col] == sel]
-            st.write(f"Filtered Orders for **{sel}**:")
-            show_cols = ['order id', 'order day', 'restaurant name', 'Resto Type', 'Payment Method', 'status', 'item total', 'driver payout', 'Bonus Amount', 'coupon discount', 'Calculated Payout']
+            st.write("---")
+            st.write(f"Order Details for **{sel}**:")
+            show_cols = ['order id', 'order day', 'restaurant name', 'Resto Type', 'Payment Method', 'status', 'item total', 'driver payout', 'Bonus Amount', 'Calculation Type', 'Calculated Payout']
             show_cols = [c for c in show_cols if c in d_ord.columns]
             st.dataframe(d_ord[show_cols])
 

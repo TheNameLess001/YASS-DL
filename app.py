@@ -9,10 +9,7 @@ st.set_page_config(page_title="Driver Payout Calculator", layout="wide")
 st.title("💰 Driver Payout Calculator")
 st.markdown("""
 This platform calculates the final payouts for delivery agents.
-**Updates:**
-1. **Cash Logic Revised**: Now calculates negative balance (Debt) for Cash orders.
-2. **Coupons**: Added coupon compensation to the calculation.
-3. **Auto-Filter**: Removes non-delivered orders.
+**Status:** Fixed 'AttributeError' by safely handling missing Advance/Credit columns.
 """)
 
 # --- 1. File Uploaders ---
@@ -33,12 +30,14 @@ def load_file(uploaded_file):
         if uploaded_file.name.endswith('.csv'):
             uploaded_file.seek(0)
             df = pd.read_csv(uploaded_file, sep=',')
+            # If separator detection failed (only 1 col), try semicolon
             if df.shape[1] < 2:
                 uploaded_file.seek(0)
                 df = pd.read_csv(uploaded_file, sep=';')
         else:
             df = pd.read_excel(uploaded_file)
         
+        # Clean columns immediately
         df.columns = df.columns.str.strip().str.replace('"', '') 
         return df
     except Exception as e:
@@ -62,9 +61,8 @@ def calculate_order_payout(row, cash_co_ids):
     service_charge = float(row.get('service charge', 0) or 0)
     resto_comm = float(row.get('restaurant commission', 0) or 0)
     
-    # Coupon handling (Try 'coupon discount' or 'Discount Amount')
+    # Coupon handling
     coupon = float(row.get('coupon discount', 0) or 0)
-    # Sometimes coupon discount is 0 but there is a Total Discount Amount
     if coupon == 0:
         coupon = float(row.get('Total Discount Amount', 0) or 0)
     
@@ -89,7 +87,7 @@ def calculate_order_payout(row, cash_co_ids):
     if is_returned:
         return item_total
 
-    # 2. Yassir Market: Standard Payout (Assuming no complex cash handling overrides specified)
+    # 2. Yassir Market
     if is_yassir_market:
         return driver_payout + bonus
 
@@ -97,20 +95,12 @@ def calculate_order_payout(row, cash_co_ids):
     if is_cash:
         if is_instant:
             # Case 3: Cash + Instant Restaurant
-            # Driver collects (Item + Service + Payout).
-            # Driver pays Resto (Item - Commission).
-            # Driver Net Hold = Service + Payout + Commission.
-            # Coupon reduces the cash he collected/holds.
-            # Balance = Earnings - (Net Hold - Coupon)
-            # Balance = (Payout + Bonus) - (Service + Payout + Commission - Coupon)
+            # Balance = Earnings - (Net Cash Held - Coupon)
             # Result: Bonus + Coupon - Service - Commission
             return bonus + coupon - service_charge - resto_comm
         else:
             # Case 4: Cash + 15 Day (Cash Co)
-            # Driver collects (Item + Service + Payout). Pays nothing.
-            # Driver Net Hold = Item + Service + Payout.
-            # Balance = Earnings - (Net Hold - Coupon)
-            # Balance = (Payout + Bonus) - (Item + Service + Payout - Coupon)
+            # Balance = Earnings - (Cash Held - Coupon)
             # Result: Bonus + Coupon - Item Total - Service
             return bonus + coupon - item_total - service_charge
 
@@ -118,14 +108,10 @@ def calculate_order_payout(row, cash_co_ids):
     if is_card: 
         if is_instant:
             # Case 5a: Partner Instant
-            # Driver paid the restaurant with his own money?
-            # User said: "agent pay the restaurant with his proper cash... got nothing from customer"
-            # So we reimburse him: Payout + Item - Comm - Service
-            # (Assuming Bonus applies too)
+            # Reimburse driver for paying resto
             return (driver_payout + item_total - resto_comm - service_charge) + bonus
         else:
             # Case 5b: 15-Day Payment
-            # Simple payout
             return driver_payout + bonus
 
     # Fallback
@@ -148,7 +134,6 @@ if uploaded_main_files:
         initial_count = len(df)
         
         # --- 0. FILTER: Delete non-delivered ---
-        # Keep 'Delivered' OR 'Returned'
         if 'status' in df.columns:
             status_mask = df['status'].astype(str).str.lower() == 'delivered'
             returned_mask = df['status'].astype(str).str.lower().str.contains('returned')
@@ -255,9 +240,16 @@ if uploaded_main_files:
                     df_rib_c.columns = ['clean_name', 'RIB']
                     driver_stats = pd.merge(driver_stats, df_rib_c, on='clean_name', how='left')
 
-        # --- 6. Final Net ---
-        driver_stats['Advance Amount'] = driver_stats.get('Advance Amount', 0).fillna(0)
-        driver_stats['Credit Amount'] = driver_stats.get('Credit Amount', 0).fillna(0)
+        # --- 6. Final Net (FIXED) ---
+        if 'Advance Amount' not in driver_stats.columns:
+            driver_stats['Advance Amount'] = 0.0
+        else:
+            driver_stats['Advance Amount'] = driver_stats['Advance Amount'].fillna(0)
+            
+        if 'Credit Amount' not in driver_stats.columns:
+            driver_stats['Credit Amount'] = 0.0
+        else:
+            driver_stats['Credit Amount'] = driver_stats['Credit Amount'].fillna(0)
         
         driver_stats['Final Net Payout'] = driver_stats['Base Earnings'] - driver_stats['Advance Amount'] - driver_stats['Credit Amount']
         

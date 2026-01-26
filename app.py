@@ -9,7 +9,7 @@ st.set_page_config(page_title="Driver Payout Calculator", layout="wide")
 st.title("💰 Driver Payout Calculator")
 st.markdown("""
 This platform calculates the final payouts for delivery agents based on your specific business rules.
-**Status:** Fixed 'driver Phone' column error by automatically cleaning column names.
+**Status:** Fixed CSV separator detection (Auto-detects comma vs semicolon).
 """)
 
 # --- 1. File Uploaders ---
@@ -23,25 +23,30 @@ uploaded_rib = st.sidebar.file_uploader("Upload Driver RIB File (Delivery guys R
 
 # --- 2. Helper Functions ---
 
-def load_file(uploaded_file, sep=None):
+def load_file(uploaded_file):
+    """
+    Loads a file and automatically attempts to detect if it is comma or semicolon separated.
+    """
     if uploaded_file is None:
         return None
     try:
         if uploaded_file.name.endswith('.csv'):
-            if sep:
-                df = pd.read_csv(uploaded_file, sep=sep)
-            else:
-                try:
-                    df = pd.read_csv(uploaded_file)
-                except:
-                    uploaded_file.seek(0)
-                    df = pd.read_csv(uploaded_file, sep=';')
+            # Attempt 1: Try reading with comma
+            uploaded_file.seek(0)
+            df = pd.read_csv(uploaded_file, sep=',')
+            
+            # Check: If we only got 1 column, it might be the wrong separator. Try semicolon.
+            if df.shape[1] < 2:
+                uploaded_file.seek(0)
+                df = pd.read_csv(uploaded_file, sep=';')
+                
         else:
+            # Excel files
             df = pd.read_excel(uploaded_file)
         
-        # KEY FIX: Clean column names immediately after loading
-        # This removes spaces like " driver Phone " -> "driver Phone"
-        df.columns = df.columns.str.strip()
+        # CLEANUP: Remove whitespace from column names immediately
+        # This fixes " driver Phone " vs "driver Phone" issues
+        df.columns = df.columns.str.strip().str.replace('"', '') 
         return df
     except Exception as e:
         st.error(f"Error loading {uploaded_file.name}: {e}")
@@ -51,7 +56,8 @@ def clean_phone(phone):
     """Standardize phone numbers for merging."""
     if pd.isna(phone):
         return ""
-    s = str(phone).replace(" ", "").replace("-", "").replace(".", "")
+    # Convert to string and remove all non-digit characters roughly
+    s = str(phone).replace(" ", "").replace("-", "").replace(".", "").replace('"', '')
     return s
 
 def clean_name(name):
@@ -129,22 +135,30 @@ if uploaded_main_files:
     # Load Main Data
     df_list = []
     for f in uploaded_main_files:
-        # Main export usually uses semicolon
-        d = load_file(f, sep=';')
+        # Load with auto-detection
+        d = load_file(f)
         if d is not None:
             df_list.append(d)
     
     if df_list:
         df = pd.concat(df_list, ignore_index=True)
-        # Extra safety: strip columns again after concat
-        df.columns = df.columns.str.strip()
+        # Clean columns again after concat just in case
+        df.columns = df.columns.str.strip().str.replace('"', '')
         
         st.success(f"Loaded {len(df)} orders from {len(uploaded_main_files)} files.")
         
         # --- Check for Critical Columns ---
-        if 'driver Phone' not in df.columns:
+        # Handle case where column might be capitalized differently
+        # We create a map of lowercase -> real column name
+        col_map = {c.lower(): c for c in df.columns}
+        
+        if 'driver phone' not in col_map:
             st.error(f"Column 'driver Phone' not found. Available columns: {list(df.columns)}")
             st.stop()
+        
+        # Get the actual column name for driver phone (e.g. "driver Phone" or "Driver Phone")
+        phone_col = col_map['driver phone']
+        name_col = col_map.get('driver name', 'driver name')
 
         # --- Load Cash Co (15 Day) ---
         cash_co_ids = set()
@@ -164,11 +178,11 @@ if uploaded_main_files:
         df['Calculated Payout'] = df.apply(lambda row: calculate_order_payout(row, cash_co_ids), axis=1)
         
         # Prepare for Aggregation
-        df['clean_phone'] = df['driver Phone'].apply(clean_phone)
-        df['clean_name'] = df['driver name'].apply(clean_name)
+        df['clean_phone'] = df[phone_col].apply(clean_phone)
+        df['clean_name'] = df[name_col].apply(clean_name)
         
         # Aggregation by Phone AND Name
-        driver_stats = df.groupby(['clean_phone', 'clean_name', 'driver name']).agg({
+        driver_stats = df.groupby(['clean_phone', 'clean_name', name_col]).agg({
             'order id': 'count',
             'Calculated Payout': 'sum'
         }).reset_index()
@@ -179,52 +193,67 @@ if uploaded_main_files:
         
         # 1. Advances (Avance Livreur)
         if uploaded_advance:
-            df_adv = load_file(uploaded_advance, sep=';')
+            df_adv = load_file(uploaded_advance)
             if df_adv is not None:
-                if 'driver Phone' in df_adv.columns and 'Avance' in df_adv.columns:
-                    df_adv['clean_phone'] = df_adv['driver Phone'].apply(clean_phone)
-                    df_adv['Avance'] = pd.to_numeric(df_adv['Avance'], errors='coerce').fillna(0)
+                # Flexible column matching
+                adv_col_map = {c.lower(): c for c in df_adv.columns}
+                if 'driver phone' in adv_col_map and 'avance' in adv_col_map:
+                    p_col = adv_col_map['driver phone']
+                    a_col = adv_col_map['avance']
+                    
+                    df_adv['clean_phone'] = df_adv[p_col].apply(clean_phone)
+                    df_adv['Avance'] = pd.to_numeric(df_adv[a_col], errors='coerce').fillna(0)
                     
                     adv_grouped = df_adv.groupby('clean_phone')['Avance'].sum().reset_index()
                     adv_grouped.rename(columns={'Avance': 'Advance Amount'}, inplace=True)
                     
                     driver_stats = pd.merge(driver_stats, adv_grouped, on='clean_phone', how='left')
                 else:
-                    st.warning(f"Advance file missing columns. Found: {list(df_adv.columns)}")
+                    st.warning(f"Advance file missing columns (Need 'driver Phone', 'Avance'). Found: {list(df_adv.columns)}")
         
         # 2. Credits (Credit Livreur)
         if uploaded_credit:
-            df_cred = load_file(uploaded_credit, sep=';')
+            df_cred = load_file(uploaded_credit)
             if df_cred is not None:
-                if 'driver Phone' in df_cred.columns and 'amount' in df_cred.columns:
-                    df_cred['clean_phone'] = df_cred['driver Phone'].apply(clean_phone)
+                cred_col_map = {c.lower(): c for c in df_cred.columns}
+                if 'driver phone' in cred_col_map and 'amount' in cred_col_map:
+                    p_col = cred_col_map['driver phone']
+                    a_col = cred_col_map['amount']
+                    
+                    df_cred['clean_phone'] = df_cred[p_col].apply(clean_phone)
                     
                     # Handle comma decimal if present (e.g. 27,558)
-                    if df_cred['amount'].dtype == object:
-                        df_cred['amount'] = df_cred['amount'].str.replace(',', '.').astype(float)
+                    if df_cred[a_col].dtype == object:
+                        df_cred[a_col] = df_cred[a_col].str.replace(',', '.').astype(float)
                     
-                    df_cred['Credit Amount'] = pd.to_numeric(df_cred['amount'], errors='coerce').fillna(0)
+                    df_cred['Credit Amount'] = pd.to_numeric(df_cred[a_col], errors='coerce').fillna(0)
                     
                     cred_grouped = df_cred.groupby('clean_phone')['Credit Amount'].sum().reset_index()
                     
                     driver_stats = pd.merge(driver_stats, cred_grouped, on='clean_phone', how='left')
                 else:
-                    st.warning(f"Credit file missing columns. Found: {list(df_cred.columns)}")
+                    st.warning(f"Credit file missing columns (Need 'driver Phone', 'amount'). Found: {list(df_cred.columns)}")
 
         # 3. RIB (Delivery guys RIB)
         if uploaded_rib:
             df_rib = load_file(uploaded_rib)
             if df_rib is not None:
-                if 'Intitulé du compte' in df_rib.columns and 'RIB' in df_rib.columns:
-                    df_rib['clean_name'] = df_rib['Intitulé du compte'].apply(clean_name)
+                rib_col_map = {c.lower(): c for c in df_rib.columns}
+                # Check for "intitulé du compte" or similar
+                name_key = next((k for k in rib_col_map if "intitulé" in k), None)
+                rib_key = next((k for k in rib_col_map if "rib" in k), None)
+
+                if name_key and rib_key:
+                    df_rib['clean_name'] = df_rib[rib_col_map[name_key]].apply(clean_name)
                     
                     # Deduplicate: If same name has multiple RIBs, take first
-                    df_rib_clean = df_rib[['clean_name', 'RIB']].drop_duplicates(subset=['clean_name'])
+                    df_rib_clean = df_rib[['clean_name', rib_col_map[rib_key]]].drop_duplicates(subset=['clean_name'])
+                    df_rib_clean.columns = ['clean_name', 'RIB'] # Standardize RIB col name
                     
                     # Merge on NAME since RIB file has no phone
                     driver_stats = pd.merge(driver_stats, df_rib_clean, on='clean_name', how='left')
                 else:
-                    st.warning(f"RIB file missing columns. Found: {list(df_rib.columns)}")
+                    st.warning(f"RIB file missing columns (Need 'Intitulé du compte', 'RIB'). Found: {list(df_rib.columns)}")
 
         # --- Final Calculation ---
         # Fill NaNs
@@ -235,7 +264,12 @@ if uploaded_main_files:
         driver_stats['Final Net Payout'] = driver_stats['Base Earnings'] - driver_stats['Advance Amount'] - driver_stats['Credit Amount']
         
         # Formatting for Display
-        final_cols = ['driver name', 'clean_phone', 'Total Orders', 'Base Earnings', 'Advance Amount', 'Credit Amount', 'Final Net Payout', 'RIB']
+        # Determine actual RIB column name if merged
+        rib_col = 'RIB' if 'RIB' in driver_stats.columns else None
+        
+        final_cols = [name_col, 'clean_phone', 'Total Orders', 'Base Earnings', 'Advance Amount', 'Credit Amount', 'Final Net Payout']
+        if rib_col: final_cols.append(rib_col)
+        
         # Only select cols that exist
         final_cols = [c for c in final_cols if c in driver_stats.columns]
         
@@ -254,9 +288,9 @@ if uploaded_main_files:
         # Optional: Show details
         st.divider()
         st.subheader("Driver Detail View")
-        selected_driver = st.selectbox("Select Driver", driver_stats['driver name'].unique())
+        selected_driver = st.selectbox("Select Driver", driver_stats[name_col].unique())
         if selected_driver:
-            driver_orders = df[df['driver name'] == selected_driver]
+            driver_orders = df[df[name_col] == selected_driver]
             st.write(f"Orders for {selected_driver}:")
             cols_to_show = ['order id', 'order time', 'restaurant name', 'Payment Method', 'status', 'item total', 'driver payout', 'Bonus Amount', 'Calculated Payout']
             cols_to_show = [c for c in cols_to_show if c in driver_orders.columns]

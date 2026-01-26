@@ -10,8 +10,9 @@ st.title("💰 Driver Payout Calculator")
 st.markdown("""
 This platform calculates the final payouts for delivery agents.
 **Updates:**
-1. Automatically removes non-delivered orders (keeps Delivered & Returned).
-2. Adds 'Resto Type' column (Instant vs Cash Co).
+1. **Cash Logic Revised**: Now calculates negative balance (Debt) for Cash orders.
+2. **Coupons**: Added coupon compensation to the calculation.
+3. **Auto-Filter**: Removes non-delivered orders.
 """)
 
 # --- 1. File Uploaders ---
@@ -61,6 +62,12 @@ def calculate_order_payout(row, cash_co_ids):
     service_charge = float(row.get('service charge', 0) or 0)
     resto_comm = float(row.get('restaurant commission', 0) or 0)
     
+    # Coupon handling (Try 'coupon discount' or 'Discount Amount')
+    coupon = float(row.get('coupon discount', 0) or 0)
+    # Sometimes coupon discount is 0 but there is a Total Discount Amount
+    if coupon == 0:
+        coupon = float(row.get('Total Discount Amount', 0) or 0)
+    
     # Extract Status/Meta
     status = str(row.get('status', '')).lower()
     returned_col = str(row.get('returned', '')).strip()
@@ -78,29 +85,50 @@ def calculate_order_payout(row, cash_co_ids):
 
     # --- Logic Application ---
     
+    # 1. Returned Orders: Always pays Item Total
     if is_returned:
         return item_total
 
+    # 2. Yassir Market: Standard Payout (Assuming no complex cash handling overrides specified)
     if is_yassir_market:
         return driver_payout + bonus
 
+    # 3. Cash Payment
     if is_cash:
         if is_instant:
-            # Case 3: Partner Instant (Driver pays Resto, Collects Cash)
-            # Payout = Earnings only (since he keeps cash difference)
-            return driver_payout + bonus
+            # Case 3: Cash + Instant Restaurant
+            # Driver collects (Item + Service + Payout).
+            # Driver pays Resto (Item - Commission).
+            # Driver Net Hold = Service + Payout + Commission.
+            # Coupon reduces the cash he collected/holds.
+            # Balance = Earnings - (Net Hold - Coupon)
+            # Balance = (Payout + Bonus) - (Service + Payout + Commission - Coupon)
+            # Result: Bonus + Coupon - Service - Commission
+            return bonus + coupon - service_charge - resto_comm
         else:
-            # Case 4: Cash Co (Driver pays nothing, Collects Cash)
-            return driver_payout + bonus
+            # Case 4: Cash + 15 Day (Cash Co)
+            # Driver collects (Item + Service + Payout). Pays nothing.
+            # Driver Net Hold = Item + Service + Payout.
+            # Balance = Earnings - (Net Hold - Coupon)
+            # Balance = (Payout + Bonus) - (Item + Service + Payout - Coupon)
+            # Result: Bonus + Coupon - Item Total - Service
+            return bonus + coupon - item_total - service_charge
 
+    # 4. Card Payment (Driver holds no cash)
     if is_card: 
         if is_instant:
-            # Case 5a: Partner Instant (Driver pays Resto with own funds)
+            # Case 5a: Partner Instant
+            # Driver paid the restaurant with his own money?
+            # User said: "agent pay the restaurant with his proper cash... got nothing from customer"
+            # So we reimburse him: Payout + Item - Comm - Service
+            # (Assuming Bonus applies too)
             return (driver_payout + item_total - resto_comm - service_charge) + bonus
         else:
             # Case 5b: 15-Day Payment
+            # Simple payout
             return driver_payout + bonus
 
+    # Fallback
     return driver_payout
 
 # --- 3. Main Execution ---
@@ -120,21 +148,16 @@ if uploaded_main_files:
         initial_count = len(df)
         
         # --- 0. FILTER: Delete non-delivered ---
-        # Keep if status is 'delivered' OR if it is a returned order (status='returned' or returned col not empty)
-        # Assuming we need to keep returned orders to pay "item total" as per rules.
-        
-        # Normalize columns for check
+        # Keep 'Delivered' OR 'Returned'
         if 'status' in df.columns:
             status_mask = df['status'].astype(str).str.lower() == 'delivered'
             returned_mask = df['status'].astype(str).str.lower().str.contains('returned')
             if 'returned' in df.columns:
-                 # Check if returned column is not empty/nan
                  returned_col_mask = df['returned'].notna() & (df['returned'].astype(str).str.strip() != '')
                  returned_mask = returned_mask | returned_col_mask
             
-            # Apply Filter
             df = df[status_mask | returned_mask].copy()
-            st.info(f"Filtered Non-Delivered Orders: {initial_count} -> {len(df)} orders remaining.")
+            st.info(f"Filtered Non-Delivered Orders: {initial_count} -> {len(df)} remaining.")
         
         # --- 1. Load Cash Co & Add Resto Type ---
         cash_co_ids = set()
@@ -144,7 +167,6 @@ if uploaded_main_files:
                 cash_co_ids = set(df_cash['Restaurant ID'].astype(str))
                 st.info(f"Loaded {len(cash_co_ids)} Cash Co Restaurants.")
 
-        # Add Resto Type Column
         if 'Restaurant ID' in df.columns:
             df['Resto Type'] = df['Restaurant ID'].astype(str).apply(
                 lambda x: 'Cash Co (15 Days)' if x in cash_co_ids else 'Instant Payment'
@@ -198,7 +220,6 @@ if uploaded_main_files:
         }).reset_index().rename(columns={'order id': 'Total Orders', 'Calculated Payout': 'Base Earnings'})
         
         # --- 5. Merge External ---
-        # Advances
         if uploaded_advance:
             df_adv = load_file(uploaded_advance)
             if df_adv is not None:
@@ -209,7 +230,6 @@ if uploaded_main_files:
                     adv_g = df_adv.groupby('clean_phone')['Avance'].sum().reset_index()
                     driver_stats = pd.merge(driver_stats, adv_g, on='clean_phone', how='left')
 
-        # Credits
         if uploaded_credit:
             df_cred = load_file(uploaded_credit)
             if df_cred is not None:
@@ -223,7 +243,6 @@ if uploaded_main_files:
                     cred_g = df_cred.groupby('clean_phone')['Credit Amount'].sum().reset_index()
                     driver_stats = pd.merge(driver_stats, cred_g, on='clean_phone', how='left')
 
-        # RIB
         if uploaded_rib:
             df_rib = load_file(uploaded_rib)
             if df_rib is not None:
@@ -237,11 +256,8 @@ if uploaded_main_files:
                     driver_stats = pd.merge(driver_stats, df_rib_c, on='clean_name', how='left')
 
         # --- 6. Final Net ---
-        if 'Advance Amount' not in driver_stats.columns: driver_stats['Advance Amount'] = 0.0
-        else: driver_stats['Advance Amount'] = driver_stats['Advance Amount'].fillna(0)
-            
-        if 'Credit Amount' not in driver_stats.columns: driver_stats['Credit Amount'] = 0.0
-        else: driver_stats['Credit Amount'] = driver_stats['Credit Amount'].fillna(0)
+        driver_stats['Advance Amount'] = driver_stats.get('Advance Amount', 0).fillna(0)
+        driver_stats['Credit Amount'] = driver_stats.get('Credit Amount', 0).fillna(0)
         
         driver_stats['Final Net Payout'] = driver_stats['Base Earnings'] - driver_stats['Advance Amount'] - driver_stats['Credit Amount']
         
@@ -262,8 +278,7 @@ if uploaded_main_files:
         if sel:
             d_ord = df[df[name_col] == sel]
             st.write(f"Filtered Orders for **{sel}**:")
-            # Updated columns to show Resto Type
-            show_cols = ['order id', 'order day', 'restaurant name', 'Resto Type', 'Payment Method', 'status', 'item total', 'driver payout', 'Bonus Amount', 'Calculated Payout']
+            show_cols = ['order id', 'order day', 'restaurant name', 'Resto Type', 'Payment Method', 'status', 'item total', 'driver payout', 'Bonus Amount', 'coupon discount', 'Calculated Payout']
             show_cols = [c for c in show_cols if c in d_ord.columns]
             st.dataframe(d_ord[show_cols])
 

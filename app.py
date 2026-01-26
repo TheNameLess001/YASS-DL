@@ -9,10 +9,10 @@ st.set_page_config(page_title="Driver Payout Calculator", layout="wide")
 st.title("💰 Driver Payout Calculator")
 st.markdown("""
 This platform calculates the final payouts for delivery agents.
-**Logic Update (Abattah Fix):**
-1.  **Cash Orders**: `Payout + Bonus + Coupon - Commission`.
-2.  **Card Orders**: `Payout + Bonus` (No food reimbursement).
-3.  **Returned**: `Item Total`.
+**Final Abattah Fix:**
+1.  **Card (Payzone)**: Now deducts **Service Charge** (`Payout + Bonus - Svc`).
+2.  **Cash**: `Payout + Bonus + Coupon - Commission`.
+3.  **Deferred**: `Bonus + Coupon - Item - Svc`.
 """)
 
 # --- 1. File Uploaders ---
@@ -55,7 +55,6 @@ def calculate_order_payout(row, cash_co_ids):
     driver_payout = float(row.get('driver payout', 0) or 0)
     bonus = float(row.get('Bonus Amount', 0) or 0)
     if pd.isna(bonus): bonus = 0
-    # Service charge & Comm used for Cash orders
     service_charge = float(row.get('service charge', 0) or 0)
     resto_comm = float(row.get('restaurant commission', 0) or 0)
     
@@ -76,6 +75,9 @@ def calculate_order_payout(row, cash_co_ids):
     is_cash = 'CASH' in pay_method
     is_card = 'CARD' in pay_method or 'CB' in pay_method or 'PAYZONE' in pay_method
     
+    resto_id = str(row.get('Restaurant ID', '')).strip()
+    is_cash_co = resto_id in cash_co_ids
+    
     # --- LOGIC ---
 
     # 1. Returned: Pays Item Total
@@ -86,19 +88,30 @@ def calculate_order_payout(row, cash_co_ids):
     if is_yassir_market:
         return driver_payout + bonus, "Yassir Market"
 
-    # 3. Cash Payment (Global Logic to match Manual Total)
+    # 3. Cash Payment
     if is_cash:
-        # Formula that matched 1475: Payout + Bonus + Coupon - Commission
-        # (Service Charge is kept by driver/ignored in this calc)
-        val = driver_payout + bonus + coupon - resto_comm
-        return val, "Cash (Std)"
+        if not is_cash_co: # Instant
+            # Matches Bader (-Comm-Svc) & Abattah (+Payout+Bonus+Coupon)
+            # Formula: Payout + Bonus + Coupon - Commission - Service Charge
+            # (Note: Earlier analysis suggested ignoring Svc for Abattah, but Bader requires it. 
+            # If this result drifts from 1475, we can toggle Svc off for Cash)
+            val = driver_payout + bonus + coupon - resto_comm - service_charge
+            return val, "Cash Instant"
+        else: # Deferred
+            # Balance = Bonus + Coupon - Item - Svc
+            # (Payout cancelled / included in debt calc)
+            val = bonus + coupon - item_total - service_charge
+            return val, "Cash 15-Day"
 
-    # 4. Card Payment (Global Logic)
+    # 4. Card Payment (Payzone)
     if is_card: 
-        # Driver does NOT pay restaurant (Integrated) -> Payout + Bonus
-        # Driver does NOT collect cash -> No Coupon/Comm adjustment needed
-        val = driver_payout + bonus
-        return val, "Card (Std)"
+        if not is_cash_co:
+            # FIX: Subtract Service Charge
+            val = driver_payout + bonus - service_charge
+            return val, "Card Instant"
+        else:
+            val = driver_payout + bonus - service_charge
+            return val, "Card 15-Day"
 
     # Fallback
     return driver_payout, "Fallback"
@@ -116,9 +129,7 @@ if uploaded_main_files:
         df = pd.concat(df_list, ignore_index=True)
         df.columns = df.columns.str.strip().str.replace('"', '')
         
-        initial_count = len(df)
-        
-        # --- 0. FILTER: Delivered + Returned ---
+        # --- 0. FILTER ---
         if 'status' in df.columns:
             status_mask = df['status'].astype(str).str.lower() == 'delivered'
             returned_mask = df['status'].astype(str).str.lower().str.contains('returned')
@@ -127,9 +138,8 @@ if uploaded_main_files:
                  returned_mask = returned_mask | returned_col_mask
             
             df = df[status_mask | returned_mask].copy()
-            st.info(f"Filtered Orders: {initial_count} -> {len(df)} remaining (Delivered/Returned).")
         
-        # Load Cash Co (Optional now if logic is uniform, but kept for future use)
+        # Load Cash Co
         cash_co_ids = set()
         if uploaded_cash_co:
             df_cash = load_file(uploaded_cash_co)
@@ -139,8 +149,6 @@ if uploaded_main_files:
 
         # --- Calculate ---
         st.subheader("Processing...")
-        
-        # Apply Logic
         results = df.apply(lambda row: calculate_order_payout(row, cash_co_ids), axis=1)
         df['Calculated Payout'] = results.apply(lambda x: x[0])
         df['Calculation Type'] = results.apply(lambda x: x[1])
@@ -214,7 +222,7 @@ if uploaded_main_files:
         if sel:
             d_ord = df[df[name_col] == sel]
             st.write(f"Orders for **{sel}**:")
-            show = ['order id', 'restaurant name', 'Payment Method', 'Calculation Type', 'Calculated Payout', 'item total', 'driver payout', 'Bonus Amount', 'coupon discount', 'restaurant commission']
+            show = ['order id', 'restaurant name', 'Payment Method', 'Calculation Type', 'Calculated Payout', 'item total', 'driver payout', 'Bonus Amount', 'coupon discount', 'service charge', 'restaurant commission']
             show = [c for c in show if c in d_ord.columns]
             st.dataframe(d_ord[show])
 

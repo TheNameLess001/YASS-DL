@@ -9,7 +9,9 @@ st.set_page_config(page_title="Driver Payout Calculator", layout="wide")
 st.title("💰 Driver Payout Calculator")
 st.markdown("""
 This platform calculates the final payouts for delivery agents.
-**Status:** Fixed 'AttributeError' by safely handling missing Advance/Credit columns.
+**Updates:**
+1. Automatically removes non-delivered orders (keeps Delivered & Returned).
+2. Adds 'Resto Type' column (Instant vs Cash Co).
 """)
 
 # --- 1. File Uploaders ---
@@ -30,14 +32,12 @@ def load_file(uploaded_file):
         if uploaded_file.name.endswith('.csv'):
             uploaded_file.seek(0)
             df = pd.read_csv(uploaded_file, sep=',')
-            # If separator detection failed (only 1 col), try semicolon
             if df.shape[1] < 2:
                 uploaded_file.seek(0)
                 df = pd.read_csv(uploaded_file, sep=';')
         else:
             df = pd.read_excel(uploaded_file)
         
-        # Clean columns immediately
         df.columns = df.columns.str.strip().str.replace('"', '') 
         return df
     except Exception as e:
@@ -78,15 +78,12 @@ def calculate_order_payout(row, cash_co_ids):
 
     # --- Logic Application ---
     
-    # Form 1: Returned
     if is_returned:
         return item_total
 
-    # Form 2: Yassir Market
     if is_yassir_market:
         return driver_payout + bonus
 
-    # Form 3 & 4: Cash Payment
     if is_cash:
         if is_instant:
             # Case 3: Partner Instant (Driver pays Resto, Collects Cash)
@@ -94,14 +91,11 @@ def calculate_order_payout(row, cash_co_ids):
             return driver_payout + bonus
         else:
             # Case 4: Cash Co (Driver pays nothing, Collects Cash)
-            # Payout = Earnings only
             return driver_payout + bonus
 
-    # Form 5: Card Payment
     if is_card: 
         if is_instant:
             # Case 5a: Partner Instant (Driver pays Resto with own funds)
-            # Payout = Earnings + Reimbursement
             return (driver_payout + item_total - resto_comm - service_charge) + bonus
         else:
             # Case 5b: 15-Day Payment
@@ -123,9 +117,42 @@ if uploaded_main_files:
         df = pd.concat(df_list, ignore_index=True)
         df.columns = df.columns.str.strip().str.replace('"', '')
         
-        st.success(f"Loaded {len(df)} orders.")
+        initial_count = len(df)
         
-        # --- Critical Columns Check ---
+        # --- 0. FILTER: Delete non-delivered ---
+        # Keep if status is 'delivered' OR if it is a returned order (status='returned' or returned col not empty)
+        # Assuming we need to keep returned orders to pay "item total" as per rules.
+        
+        # Normalize columns for check
+        if 'status' in df.columns:
+            status_mask = df['status'].astype(str).str.lower() == 'delivered'
+            returned_mask = df['status'].astype(str).str.lower().str.contains('returned')
+            if 'returned' in df.columns:
+                 # Check if returned column is not empty/nan
+                 returned_col_mask = df['returned'].notna() & (df['returned'].astype(str).str.strip() != '')
+                 returned_mask = returned_mask | returned_col_mask
+            
+            # Apply Filter
+            df = df[status_mask | returned_mask].copy()
+            st.info(f"Filtered Non-Delivered Orders: {initial_count} -> {len(df)} orders remaining.")
+        
+        # --- 1. Load Cash Co & Add Resto Type ---
+        cash_co_ids = set()
+        if uploaded_cash_co:
+            df_cash = load_file(uploaded_cash_co)
+            if df_cash is not None and 'Restaurant ID' in df_cash.columns:
+                cash_co_ids = set(df_cash['Restaurant ID'].astype(str))
+                st.info(f"Loaded {len(cash_co_ids)} Cash Co Restaurants.")
+
+        # Add Resto Type Column
+        if 'Restaurant ID' in df.columns:
+            df['Resto Type'] = df['Restaurant ID'].astype(str).apply(
+                lambda x: 'Cash Co (15 Days)' if x in cash_co_ids else 'Instant Payment'
+            )
+        else:
+            df['Resto Type'] = 'Unknown'
+
+        # --- 2. Critical Columns Check ---
         col_map = {c.lower(): c for c in df.columns}
         if 'driver phone' not in col_map:
             st.error(f"Column 'driver Phone' not found. Available: {list(df.columns)}")
@@ -134,7 +161,7 @@ if uploaded_main_files:
         phone_col = col_map['driver phone']
         name_col = col_map.get('driver name', 'driver name')
         
-        # --- Date Filter ---
+        # --- 3. Date Filter ---
         date_col = None
         for c in ['order day', 'order date', 'created at']:
             if c in col_map: date_col = col_map[c]; break
@@ -153,21 +180,12 @@ if uploaded_main_files:
                     st.stop()
                 
                 s_date, e_date = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
-                # Inclusive filtering
                 df = df[(df['temp_date'] >= s_date) & (df['temp_date'] <= e_date)].copy()
-                st.success(f"Filtered {len(df)} orders from {s_date.date()} to {e_date.date()}.")
+                st.success(f"Filtered Date Range: {len(df)} orders.")
             else:
                 st.warning("Date parsing failed. Showing all data.")
 
-        # --- Load Cash Co ---
-        cash_co_ids = set()
-        if uploaded_cash_co:
-            df_cash = load_file(uploaded_cash_co)
-            if df_cash is not None and 'Restaurant ID' in df_cash.columns:
-                cash_co_ids = set(df_cash['Restaurant ID'].astype(str))
-                st.info(f"Loaded {len(cash_co_ids)} Cash Co Restaurants.")
-
-        # --- Calculate ---
+        # --- 4. Calculate ---
         st.subheader("Processing...")
         df['Calculated Payout'] = df.apply(lambda row: calculate_order_payout(row, cash_co_ids), axis=1)
         
@@ -179,7 +197,7 @@ if uploaded_main_files:
             'Calculated Payout': 'sum'
         }).reset_index().rename(columns={'order id': 'Total Orders', 'Calculated Payout': 'Base Earnings'})
         
-        # --- Merge External ---
+        # --- 5. Merge External ---
         # Advances
         if uploaded_advance:
             df_adv = load_file(uploaded_advance)
@@ -218,17 +236,12 @@ if uploaded_main_files:
                     df_rib_c.columns = ['clean_name', 'RIB']
                     driver_stats = pd.merge(driver_stats, df_rib_c, on='clean_name', how='left')
 
-        # --- Final Net ---
-        # Safe filling of missing columns
-        if 'Advance Amount' not in driver_stats.columns:
-            driver_stats['Advance Amount'] = 0.0
-        else:
-            driver_stats['Advance Amount'] = driver_stats['Advance Amount'].fillna(0)
+        # --- 6. Final Net ---
+        if 'Advance Amount' not in driver_stats.columns: driver_stats['Advance Amount'] = 0.0
+        else: driver_stats['Advance Amount'] = driver_stats['Advance Amount'].fillna(0)
             
-        if 'Credit Amount' not in driver_stats.columns:
-            driver_stats['Credit Amount'] = 0.0
-        else:
-            driver_stats['Credit Amount'] = driver_stats['Credit Amount'].fillna(0)
+        if 'Credit Amount' not in driver_stats.columns: driver_stats['Credit Amount'] = 0.0
+        else: driver_stats['Credit Amount'] = driver_stats['Credit Amount'].fillna(0)
         
         driver_stats['Final Net Payout'] = driver_stats['Base Earnings'] - driver_stats['Advance Amount'] - driver_stats['Credit Amount']
         
@@ -248,7 +261,11 @@ if uploaded_main_files:
         sel = st.selectbox("Select Driver for Details", driver_stats[name_col].unique())
         if sel:
             d_ord = df[df[name_col] == sel]
-            st.dataframe(d_ord[['order id', 'order day', 'restaurant name', 'Payment Method', 'item total', 'driver payout', 'Bonus Amount', 'Calculated Payout']])
+            st.write(f"Filtered Orders for **{sel}**:")
+            # Updated columns to show Resto Type
+            show_cols = ['order id', 'order day', 'restaurant name', 'Resto Type', 'Payment Method', 'status', 'item total', 'driver payout', 'Bonus Amount', 'Calculated Payout']
+            show_cols = [c for c in show_cols if c in d_ord.columns]
+            st.dataframe(d_ord[show_cols])
 
 else:
     st.info("Please upload files.")
